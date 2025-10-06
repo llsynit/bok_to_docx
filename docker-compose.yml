@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  bok_to_docx:
+    build:               # ← eller bytt til `image:` dersom du bare vil pull-e
+      context: .         # mappa der Dockerfile ligger
+      dockerfile: Dockerfile
+    image: converter_bok_to_docx:latest
+    # eventuelle porter / env-variabler:
+    # ports:
+    #   - "8001:8000"
+    # environment:
+    #   LOG_LEVEL: INFO
+    networks:
+      - llsyn_network    # Felles nettverk – må eksistere fra før
+
+# -------------------------------------------------
+# Delte ressurser (eies av llsyn_production_system)
+# -------------------------------------------------
+networks:
+  llsyn_network:
+    external: true
+    # Gi Compose navnet til det *eksisterende* nettverket.
+    # Start llsyn_production_system først, finn faktisk navn med:
+    #   docker network ls | grep llsyn_network
+    # og legg det inn her:
+    name: llsyn_production_system_llsyn_network
