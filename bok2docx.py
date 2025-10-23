@@ -207,6 +207,8 @@ def prepare_soup(soup: BeautifulSoup, args: PrepareArgs, logger: logging.Logger)
                 nxt.insert_before(p)
     '''
 
+    # Moved to statpub_to_bok
+    '''
     # 4.14 – blank linje over innholdsfortegnelse/frontmatter toc
     logger.info("4.14 Blank linje over innholdsfortegnelse")
     toc = soup.find("section", attrs={"epub:type": ["frontmatter toc", "toc", "frontmatter"]})
@@ -220,6 +222,7 @@ def prepare_soup(soup: BeautifulSoup, args: PrepareArgs, logger: logging.Logger)
         prev = h.find_previous_sibling()
         if prev and getattr(prev, "name", None) and not re.match(r"^h[1-6]$", prev.name or ""):
             _prepend_blank_line(soup, h)
+    '''
 
     # Bilder/figurer → “Bilde: <alt>”
     logger.info("8.x Bilder/figurer")
@@ -249,6 +252,8 @@ def prepare_soup(soup: BeautifulSoup, args: PrepareArgs, logger: logging.Logger)
         if depth > 0:
             li.insert(0, NavigableString(TOINN * (depth - 1)))
 
+    # Moved to statpub_to_bok
+    '''
     # Oppgavetegn “>>>” → blank linje foran og etter
     logger.info("4.1 Blank linje rundt oppgaver (>>>)")
     for p in soup.find_all("p"):
@@ -261,6 +266,7 @@ def prepare_soup(soup: BeautifulSoup, args: PrepareArgs, logger: logging.Logger)
             empty_after = soup.new_tag("p")
             empty_after.string = EMPTY
             p.insert_after(empty_after)
+    '''
 
     # Excel-lignende tabeller: trekk dem ut (om ikke slått av)
     if not args.no_excel:
