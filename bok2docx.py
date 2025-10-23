@@ -1,105 +1,691 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+bok_to_docx.py — én-filskonverterer for XHTML/EPUB → DOCX
+
+Integrert pipeline (tidligere tre filer samlet i én):
+  1) Forberedelse (tidl. prepareXdocx.py)
+  2) Pandoc-konvertering (tidl. pandoc_wrapper.py)
+  3) Rydding/etterbehandling i DOCX (tidl. clean.py)
+
+Bruk
+----
+CLI:
+  python bok_to_docx.py convert INPUT [-o out.docx] [--stdout]
+      [--reference-docx ref.docx] [--pandoc-arg ...]
+      [--grade N] [-m|--mathematics] [-s|--science] [-t|--toc-levels N]
+      [--no-excel] [--log-level INFO|DEBUG|...]
+
+Eksempler:
+  # Fil → DOCX
+  python bok_to_docx.py convert book.xhtml -o book.docx
+
+  # Mappa til en utpakket EPUB → DOCX (finner hoved-.xhtml automatisk)
+  python bok_to_docx.py convert unpacked_epub_dir -o out.docx
+
+  # Stdin → stdout
+  cat book.xhtml | python bok_to_docx.py convert - --stdout > out.docx
+
+Som bibliotek:
+  from bok_to_docx import xhtml_to_docx
+  bytes_out = xhtml_to_docx(xhtml_bytes, "out.docx", reference_docx=Path("static/referenceDoc.docx"))
+
+Avhenger av:
+  - pandoc (må finnes i PATH, eller sett PANDOC_BIN)
+  - Python-pakker: beautifulsoup4, lxml, pandas, python-docx
+
+© 2025
+"""
 from __future__ import annotations
 
+import argparse
+import io
+import logging
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional, Sequence
 
-# Hjelpemoduler fra repoet – hvis de finnes bruker vi dem,
-# ellers faller vi tilbake til ren pandoc-CLI.
-try:
-    import pandoc_wrapper  # type: ignore
-except Exception:
-    pandoc_wrapper = None  # fallback
+# --- 3.partsbibliotek (må være installert) -----------------------------------
+from bs4 import BeautifulSoup, NavigableString
+from pandas import DataFrame
+from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.shared import Pt
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 
-try:
-    import clean  # type: ignore
-except Exception:
-    clean = None  # fallback
+# --- Konstanter / miljø -------------------------------------------------------
+DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+PANDOC_BIN = os.getenv("PANDOC_BIN", "pandoc")
 
-try:
-    import prepareXdocx  # type: ignore
-except Exception:
-    prepareXdocx = None  # fallback
+THIS_DIR = Path(__file__).resolve().parent
+STATIC_DIR = THIS_DIR / "static"
+OUTPUT_DIR = THIS_DIR / "output"
+
+# Marker/”tokens” brukt både i prepare og clean:
+EMPTY = "EMPTY_LINE"
+NOINDENT = "NOINDENT"
+TOINN = "TOINN"
+NUMBER_PREFIX = "--- "
+
+DEFAULT_GRADE = 8  # barnetrinn-regel (fontvalg mm i clean)
+FONT_NAME_JUNIOR = "Courier New"
+FONT_NAME_SENIOR = "Verdana"
+FONT_SIZE_JUNIOR = 12
+FONT_SIZE_SENIOR = 13
+
+# Tittel-opprydding:
+LANGUAGES_TRAILING = ["Bokmål", "Nynorsk", "BokmÃ¥l"]  # OBS: inkluder mulig ikke-UTF8-rest
+
+# Excel-deteksjon
+MAX_TABLE_WIDTH_CHARS = 54  # ca. bredde for å vurdere om tabell bør ut
+EXCEL_DIRNAME = "Excel"
+
+# ------------------------------------------------------------------------------
+def configure_logging(level: str = DEFAULT_LOG_LEVEL) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+logger = logging.getLogger("bok_to_docx")
+
+# ==============================================================================
+# 1) PREPARE (tidligere prepareXdocx.py — forkortet/robustifisert)
+# ==============================================================================
+
+def get_table_width_chars(table) -> int:
+    """Estimér ca. tegnbredde for tabellen basert på antall kolonner."""
+    max_cols = 0
+    for row in table.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        max_cols = max(max_cols, len(cells))
+    # ca. 10 tegn pr kolonne – justerbar heuristikk
+    return max_cols * 10
 
 
-def _run_pandoc_cli(infile: Path, outfile: Path) -> None:
-    """Kjør pandoc direkte for HTML → DOCX."""
-    cmd = [
-        "pandoc",
-        str(infile),
-        "-f", "html",
-        "-t", "docx",
-        "-o", str(outfile),
-    ]
-    subprocess.run(cmd, check=True)
+def is_excel_like_table(table) -> bool:
+    """
+    En enkel gjenkjenning av “Excel-lignende” tabell:
+      1) øverste venstre celle tom
+      2) første rad (unntatt col 0) A, B, C …
+      3) første kolonne (unntatt rad 0) 1, 2, 3 …
+    """
+    if not table or table.name != "table":
+        return False
+
+    rows = table.find_all("tr")
+    if len(rows) < 2:
+        return False
+
+    first_row_cells = rows[0].find_all(["td", "th"])
+    first_col_cells = [r.find(["td", "th"]) for r in rows[1:]]
+
+    # (1) tom øvre-venstre?
+    if first_row_cells and first_row_cells[0].get_text(strip=True):
+        return False
+
+    # (2) A, B, C...
+    expected_headers = [chr(ord("A") + i) for i in range(len(first_row_cells)-1)]
+    actual_headers = [c.get_text(strip=True) for c in first_row_cells[1:]]
+    if actual_headers[:len(expected_headers)] != expected_headers[:len(actual_headers)]:
+        return False
+
+    # (3) 1, 2, 3...
+    for i, cell in enumerate(first_col_cells, start=1):
+        if not cell:
+            return False
+        if cell.get_text(strip=True) != str(i):
+            return False
+
+    return True
 
 
-def _run_pandoc(infile: Path, outfile: Path) -> None:
-    """Foretrukket: bruk pandoc_wrapper hvis tilgjengelig, ellers CLI."""
-    if pandoc_wrapper and hasattr(pandoc_wrapper, "run_pandoc"):
-        # Mange varianter finnes – prøv enkel signatur, ellers fall tilbake
-        try:
-            pandoc_wrapper.run_pandoc(
-                input_path=str(infile),
-                output_path=str(outfile),
-                from_fmt="html",
-                to_fmt="docx",
-            )
-            return
-        except TypeError:
-            # annen signatur i ditt repo?
-            pandoc_wrapper.run_pandoc(str(infile), str(outfile), "html", "docx")
-            return
-    # Fallback
-    _run_pandoc_cli(infile, outfile)
+@dataclass
+class PrepareArgs:
+    mathematics: bool = False
+    science: bool = False
+    verbose: bool = False
+    toc_levels: Optional[int] = None
+    grade: Optional[int] = None
+    no_excel: bool = False
 
 
-def _optional_prepare(docx_path: Path) -> None:
-    if prepareXdocx and hasattr(prepareXdocx, "prepare_docx"):
-        try:
-            prepareXdocx.prepare_docx(str(docx_path))
-        except Exception:
-            # ikke fatal
-            pass
+def _prepend_blank_line(soup, element):
+    """Sett inn en EMPTY_LINE før 'element' når hensiktsmessig."""
+    empty_p = soup.new_tag("p")
+    empty_p.string = EMPTY
+    element.insert_before(empty_p)
 
 
-def _optional_clean(docx_path: Path) -> None:
-    if clean:
-        # Støtt både modul- og funksjonsnavn som kan finnes i repoet
-        for fn in ("clean_docx_file", "clean", "clean_docx"):
-            f = getattr(clean, fn, None)
-            if callable(f):
-                try:
-                    f(str(docx_path))
-                except Exception:
-                    pass
+def prepare_soup(soup: BeautifulSoup, args: PrepareArgs, logger: logging.Logger) -> BeautifulSoup:
+    """
+    Forbered HTML/XHTML for Pandoc/DOCX:
+      - pagebreak → ‘--- N’ avsnitt
+      - blank linje (EMPTY_LINE) foran overskrifter (m.fl.)
+      - enkel regel for figurer/bilder → 'Bilde: alt-tekst'
+      - listejustering / innrykk med TOINN
+      - "Excel-lignende" tabeller flyttes ut til CSV (hvis ikke --no-excel)
+    """
+    grade = args.grade if args.grade is not None else DEFAULT_GRADE
+
+    # Moved to statpub_to_bok
+    '''
+    # 4.12 – sidetall (epub:type=pagebreak) → ‘--- <id|title>’
+    logger.info("4.12 Sidetall")
+    for pagebreak in soup(attrs={"epub:type": "pagebreak"}):
+        insert_after = pagebreak
+        p = soup.new_tag("p")
+        if "title" in pagebreak.attrs:
+            p.string = f"{NUMBER_PREFIX}{pagebreak['title']}"
+        elif "id" in pagebreak.attrs:
+            p.string = f"{NUMBER_PREFIX}{pagebreak['id'].split('-')[-1]}"
+        else:
+            p.string = f"{NUMBER_PREFIX}".rstrip()
+
+        # sett etter nærmeste p hvis pagebreak var inni et avsnitt
+        for parent in pagebreak.parents:
+            if parent.name == "p":
+                insert_after = parent
                 break
 
+        insert_after.insert_after(p)
+        pagebreak.decompose()
 
-def xhtml_to_docx(xhtml_bytes: bytes, output_filename: Optional[str] = "output.docx") -> bytes:
+        # flytt opp om vi står rett inni section
+        if p.parent and p.parent.name == "section":
+            nxt = p.find_next_sibling()
+            if nxt and nxt.name in ("p", "section", "div"):
+                nxt.insert_before(p)
+    '''
+
+    # 4.14 – blank linje over innholdsfortegnelse/frontmatter toc
+    logger.info("4.14 Blank linje over innholdsfortegnelse")
+    toc = soup.find("section", attrs={"epub:type": ["frontmatter toc", "toc", "frontmatter"]})
+    if toc:
+        if toc.previous_sibling and getattr(toc.previous_sibling, "name", None):
+            _prepend_blank_line(soup, toc)
+
+    # Blank linje over overskrifter, unntatt når overskrifter følger rett etter hverandre
+    logger.info("4.14 Blank linje over overskrifter")
+    for h in soup.find_all(re.compile(r"^h[1-6]$")):
+        prev = h.find_previous_sibling()
+        if prev and getattr(prev, "name", None) and not re.match(r"^h[1-6]$", prev.name or ""):
+            _prepend_blank_line(soup, h)
+
+    # Bilder/figurer → “Bilde: <alt>”
+    logger.info("8.x Bilder/figurer")
+    for fig in soup.find_all("figure"):
+        # Finn img/alt
+        alt = None
+        img = fig.find("img")
+        if img and img.has_attr("alt"):
+            alt = img["alt"]
+        # Sett inn “Bilde: …” før figuren
+        p = soup.new_tag("p")
+        p.string = "Bilde:" + (f" {alt}" if alt else "")
+        fig.insert_before(p)
+
+    for img in soup.find_all("img"):
+        # Unngå duplikat hvis allerede håndtert via <figure>
+        if not img.find_parent("figure"):
+            alt = img.get("alt", "")
+            p = soup.new_tag("p")
+            p.string = "Bilde:" + (f" {alt}" if alt else "")
+            img.insert_before(p)
+
+    # Lister: legg inn logiske innrykk ved hjelp av TOINN
+    logger.info("4.x Lister → innrykk med TOINN")
+    for li in soup.find_all("li"):
+        depth = sum(1 for p in li.parents if getattr(p, "name", None) in ("ul", "ol"))
+        if depth > 0:
+            li.insert(0, NavigableString(TOINN * (depth - 1)))
+
+    # Oppgavetegn “>>>” → blank linje foran og etter
+    logger.info("4.1 Blank linje rundt oppgaver (>>>)")
+    for p in soup.find_all("p"):
+        text = p.get_text(strip=True)
+        if text.startswith(">>>"):
+            prev = p.previous_sibling
+            if prev and getattr(prev, "name", None) != "p":
+                _prepend_blank_line(soup, p)
+            # blank etter
+            empty_after = soup.new_tag("p")
+            empty_after.string = EMPTY
+            p.insert_after(empty_after)
+
+    # Excel-lignende tabeller: trekk dem ut (om ikke slått av)
+    if not args.no_excel:
+        logger.info("Tabeller: Excel-sjekk og mulig utskilling")
+        excel_root = OUTPUT_DIR / EXCEL_DIRNAME
+        if excel_root.exists():
+            shutil.rmtree(excel_root)
+        excel_root.mkdir(parents=True, exist_ok=True)
+
+        tables_to_extract = []
+        for t in soup.find_all("table"):
+            width_chars = get_table_width_chars(t)
+            if is_excel_like_table(t) or width_chars > MAX_TABLE_WIDTH_CHARS:
+                tables_to_extract.append(t)
+
+        # erstatt tabellene og lagre CSV-er
+        for idx, t in enumerate(tables_to_extract, start=1):
+            rows = []
+            for row in t.find_all("tr"):
+                cells = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+                rows.append(cells)
+            df = DataFrame(rows)
+            csv_path = excel_root / f"table_{idx}.csv"
+            df.to_csv(csv_path, index=False, header=False)
+
+            repl = soup.new_tag("p")
+            repl.string = f"[Tabell flyttet til {EXCEL_DIRNAME}/table_{idx}.csv]"
+            t.insert_before(repl)
+            t.decompose()
+
+    # Returnér et renset BeautifulSoup-objekt (som XML/XHTML)
+    return BeautifulSoup(str(soup), "lxml-xml")
+
+
+# ==============================================================================
+# 2) PANDOC (tidligere pandoc_wrapper.py)
+# ==============================================================================
+
+@dataclass
+class PandocOptions:
+    pandoc_bin: str = PANDOC_BIN
+    reference_docx: Optional[Path] = None
+    extra_flags: Sequence[str] = ()
+
+
+def run_pandoc(input_path: Path, output_path: Path, opts: PandocOptions) -> None:
     """
-    Konverter XHTML/HTML → DOCX med pandoc, og kjør ev. prepare/clean-trinn dersom modulene finnes.
-    Returnerer DOCX-bytes.
+    Kjører pandoc for å lage DOCX av XHTML/HTML.
+    Søker default etter static/referenceDoc.docx hvis ikke eksplisitt oppgitt.
     """
-    if not output_filename or not output_filename.lower().endswith(".docx"):
-        output_filename = (output_filename or "output") + ".docx"
+    ref_doc = opts.reference_docx
+    if ref_doc is None:
+        candidate = STATIC_DIR / "referenceDoc.docx"
+        if candidate.exists():
+            ref_doc = candidate
 
-    with tempfile.TemporaryDirectory() as td:
-        tmpdir = Path(td)
-        in_html = tmpdir / "input.xhtml"
-        out_docx = tmpdir / Path(output_filename).name
+    cmd = [
+        opts.pandoc_bin,
+        str(input_path),
+        "-f", "html",
+        "-t", "docx",
+        "-o", str(output_path),
+        "--standalone",
+    ]
+    if ref_doc and ref_doc.exists():
+        cmd.extend(["--reference-doc", str(ref_doc)])
 
+    # bruker-flagg til slutt (f.eks --strip-comments, --toc)
+    if opts.extra_flags:
+        cmd.extend(list(opts.extra_flags))
+
+    logger.info("Kjører pandoc: %s", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError as e:
+        raise RuntimeError(f"Finner ikke pandoc-binæren {opts.pandoc_bin!r}. Sett PANDOC_BIN eller legg i PATH.") from e
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Pandoc feilet med exit {e.returncode}") from e
+
+
+# ==============================================================================
+# 3) CLEAN (tidligere clean.py — kondensert, men dekker hovedregler)
+# ==============================================================================
+
+def _insert_paragraph_after(paragraph: Paragraph, text: str = "") -> Paragraph:
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    new_para = Paragraph(new_p, paragraph._parent)
+    if text:
+        new_para.text = text
+    return new_para
+
+
+def _get_previous_paragraph(paragraph: Paragraph) -> Optional[Paragraph]:
+    prev = paragraph._p.getprevious()
+    while prev is not None:
+        if prev.tag.endswith("}p"):
+            return Paragraph(prev, paragraph._parent)
+        prev = prev.getprevious()
+    return None
+
+
+def _remove_paragraph(paragraph: Paragraph) -> None:
+    p = paragraph._element
+    p.getparent().remove(p)
+    paragraph._element = None
+
+
+@dataclass
+class CleanArgs:
+    grade: Optional[int] = None
+
+
+def clean_document(document: Document, args: CleanArgs, logger: logging.Logger) -> Document:
+    """
+    Rydder i DOCX-innholdet:
+      - EMPTY_LINE → blank avsnitt (men unngå doble)
+      - TOINN → 2 mellomrom
+      - NOINDENT fjernes først i linje
+      - blank linje foran overskrifter hvis nødvendig
+      - fjern tomme avsnitt etter tallinje '--- N'
+    + enkel fontpolicy basert på trinn
+    """
+    grade = args.grade if args.grade is not None else DEFAULT_GRADE
+    font_name = FONT_NAME_JUNIOR if grade <= 7 else FONT_NAME_SENIOR
+    font_size = FONT_SIZE_JUNIOR if grade <= 7 else FONT_SIZE_SENIOR
+
+    logger.info("Rydder DOCX …")
+
+    for i, p in enumerate(list(document.paragraphs)):
+        text = p.text or ""
+
+        # Tokens
+        if text.strip() == EMPTY:
+            prev = _get_previous_paragraph(p)
+            if prev and prev.text.strip() == "":
+                _remove_paragraph(p)
+                continue
+            p.text = " "
+
+        if TOINN in text:
+            p.text = text.replace(TOINN, "  ")
+            text = p.text
+
+        if text.startswith(NOINDENT):
+            p.text = text.replace(NOINDENT, "", 1)
+            text = p.text
+
+        # Unngå dobbel blank etter ‘--- N’
+        if text.strip() == "":
+            prev = _get_previous_paragraph(p)
+            if prev and (prev.text.strip() == "" or prev.text.strip().startswith(NUMBER_PREFIX)):
+                _remove_paragraph(p)
+                continue
+
+        # Blank linje før overskrifter (hvis ikke blank/side nr. fra før)
+        if p.style and "Heading" in p.style.name:
+            prev = _get_previous_paragraph(p)
+            if prev and not (prev.text.strip() == "" or prev.text.strip().startswith(NUMBER_PREFIX)):
+                _insert_paragraph_after(prev, "")
+
+        # Sett font for alle runs
+        for run in p.runs:
+            f = run.font
+            f.name = font_name
+            f.size = Pt(font_size)
+            # Øst-Asia fallback (Word)
+            if run._element.rPr is not None:
+                run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
+
+    return document
+
+
+def _derive_title(document: Document) -> str:
+    """Hent tittel fra core properties eller første avsnitt med stil 'Title'."""
+    title = document.core_properties.title or ""
+    if not title:
+        for p in document.paragraphs:
+            try:
+                if p.style and p.style.name.lower() == "title" and p.text.strip():
+                    title = p.text.strip()
+                    break
+            except Exception:
+                pass
+
+    if title:
+        # fjern evt. trailing språk-ord
+        pattern = r"\s+(" + "|".join(map(re.escape, LANGUAGES_TRAILING)) + r")$"
+        title = re.sub(pattern, "", title, flags=re.IGNORECASE).strip()
+    return title or "Dokument"
+
+
+# ==============================================================================
+# 4) HØYNIVÅ-PIPELINE
+# ==============================================================================
+
+def _read_soup_from_input(input_path: Path) -> tuple[BeautifulSoup, Path]:
+    """
+    Les XHTML enten fra en fil eller fra en mappe med utpakket EPUB.
+    Returnerer (soup, faktisk_xhtml_fil).
+    """
+    if input_path.is_dir():
+        # Finn første .xhtml som ikke er nav.xhtml
+        xhtml_files = [p for p in input_path.glob("*.xhtml") if p.name.lower() != "nav.xhtml"]
+        if not xhtml_files:
+            raise FileNotFoundError(f"Fant ingen .xhtml i {input_path}")
+        if len(xhtml_files) > 1:
+            logger.warning("Fant flere .xhtml-filer, bruker: %s", xhtml_files[0].name)
+        target = xhtml_files[0]
+    else:
+        target = input_path
+        if target.suffix.lower() not in {".xhtml", ".html", ".htm"}:
+            logger.warning("Input ser ikke ut som XHTML/HTML: %s", target.name)
+
+    with target.open("rb") as f:
+        data = f.read()
+    # bruk XML-parser, men tåler HTML
+    soup = BeautifulSoup(data, "lxml-xml")
+    return soup, target
+
+
+def xhtml_to_docx(
+    xhtml_bytes: bytes,
+    output_filename: str = "output.docx",
+    *,
+    reference_docx: Optional[Path] = None,
+    pandoc_args: Sequence[str] = (),
+    grade: Optional[int] = None,
+    mathematics: bool = False,
+    science: bool = False,
+    toc_levels: Optional[int] = None,
+    no_excel: bool = False,
+) -> bytes:
+    """API: bytes → bytes."""
+    prep_args = PrepareArgs(
+        mathematics=mathematics,
+        science=science,
+        verbose=False,
+        toc_levels=toc_levels,
+        grade=grade,
+        no_excel=no_excel,
+    )
+    pandoc_opts = PandocOptions(reference_docx=reference_docx, extra_flags=pandoc_args)
+    clean_args = CleanArgs(grade=grade)
+
+    with tempfile.TemporaryDirectory(prefix="bok_to_docx_") as tmp_s:
+        tmp = Path(tmp_s)
+        in_html = tmp / "in.xhtml"
         in_html.write_bytes(xhtml_bytes)
 
-        _run_pandoc(in_html, out_docx)
+        # prepare
+        soup = BeautifulSoup(xhtml_bytes, "lxml-xml")
+        prepared = prepare_soup(soup, prep_args, logger)
+        prepared_html = tmp / "prepared.xhtml"
+        prepared_html.write_text(str(prepared), encoding="utf-8")
+
+        # pandoc
+        out_docx = tmp / Path(output_filename).name
+        run_pandoc(prepared_html, out_docx, pandoc_opts)
         if not out_docx.exists():
-            raise RuntimeError("Pandoc genererte ingen DOCX-fil")
+            raise RuntimeError("Pandoc genererte ingen DOCX")
 
-        # Valgfri post-prosessering
-        _optional_prepare(out_docx)
-        _optional_clean(out_docx)
+        # clean
+        doc = Document(str(out_docx))
+        doc = clean_document(doc, clean_args, logger)
 
-        return out_docx.read_bytes()
+        # output as bytes
+        final_docx = tmp / Path(output_filename).name
+        doc.save(str(final_docx))
+        return final_docx.read_bytes()
+
+
+# ==============================================================================
+# 5) CLI
+# ==============================================================================
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bok_to_docx",
+        description="Konverter XHTML/utpakket EPUB → DOCX i én fil (prepare + pandoc + clean).",
+    )
+    p.add_argument("--log-level", default=DEFAULT_LOG_LEVEL,
+                   choices=["CRITICAL","ERROR","WARNING","INFO","DEBUG"], help="Loggnivå")
+    p.add_argument("--reference-docx", type=Path, default=None,
+                   help="Referanse-DOCX (overstyrer static/referenceDoc.docx).")
+    p.add_argument("--pandoc-arg", action="append", default=[],
+                   help="Ekstra flagg til pandoc (kan gjentas).")
+    p.add_argument("--stdout", action="store_true", help="Skriv DOCX til stdout (binær).")
+    p.add_argument("--no-excel", action="store_true", help="Skru av Excel-uttrekk av tabeller.")
+
+    # prepare/clean-relaterte flagg
+    p.add_argument("-g","--grade", type=int, help="Klassetrinn (påvirker fontvalg i DOCX).")
+    p.add_argument("-m","--mathematics", action="store_true", help="Matematikkbok (hint).")
+    p.add_argument("-s","--science", action="store_true", help="Naturfag (hint).")
+    p.add_argument("-t","--toc-levels", type=int, help="Antall TOC-nivåer (hint til prepare).")
+
+    sub = p.add_subparsers(dest="command", required=True)
+
+    c = sub.add_parser("convert", help="Konverter en fil eller mappe (eller '-' for stdin).")
+    c.add_argument("input", help="XHTML/HTML-fil, mappe (utpakket EPUB), eller '-' for stdin.")
+    c.add_argument("-o","--output", type=Path, help="Output .docx")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    configure_logging(args.log_level)
+
+    # Sett opp hjelpe-objekter
+    prep_args = PrepareArgs(
+        mathematics=args.mathematics,
+        science=args.science,
+        verbose=(args.log_level == "DEBUG"),
+        toc_levels=args.toc_levels,
+        grade=args.grade,
+        no_excel=args.no_excel,
+    )
+    pandoc_opts = PandocOptions(reference_docx=args.reference_docx, extra_flags=args.pandoc_arg or ())
+    clean_args = CleanArgs(grade=args.grade)
+
+    # --- INPUT: fil, mappe, eller stdin
+    if args.command == "convert":
+        if args.input == "-":
+            data = sys.stdin.buffer.read()
+            if not data:
+                logger.error("Ingen data på stdin.")
+                return 2
+            out_name = args.output.name if args.output else "output.docx"
+            try:
+                out_bytes = xhtml_to_docx(
+                    data, out_name,
+                    reference_docx=args.reference_docx,
+                    pandoc_args=args.pandoc_arg or (),
+                    grade=args.grade,
+                    mathematics=args.mathematics,
+                    science=args.science,
+                    toc_levels=args.toc_levels,
+                    no_excel=args.no_excel,
+                )
+            except Exception as e:
+                logger.error("Konvertering feilet: %s", e)
+                return 1
+
+            if args.stdout:
+                sys.stdout.buffer.write(out_bytes)
+            else:
+                if not args.output:
+                    logger.error("Må angi -o/--output hvis ikke --stdout.")
+                    return 2
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_bytes(out_bytes)
+                logger.info("Skrev %s (%.1f KB)", args.output, len(out_bytes)/1024.0)
+            return 0
+
+        # Fil eller mappe
+        in_path = Path(args.input).expanduser().resolve()
+        if not in_path.exists():
+            logger.error("Finner ikke input: %s", in_path)
+            return 2
+
+        try:
+            soup, actual_xhtml = _read_soup_from_input(in_path)
+        except Exception as e:
+            logger.error("Klarte ikke lese input: %s", e)
+            return 2
+
+        with tempfile.TemporaryDirectory(prefix="bok_to_docx_") as tmp_s:
+            tmp = Path(tmp_s)
+
+            # prepare
+            prepared = prepare_soup(soup, prep_args, logger)
+            prepared_html = tmp / (actual_xhtml.name if actual_xhtml.suffix else "prepared.xhtml")
+            prepared_html.write_text(str(prepared), encoding="utf-8")
+
+            # pandoc
+            out_docx_tmp = tmp / ((args.output.name if args.output else actual_xhtml.with_suffix(".docx").name))
+            try:
+                run_pandoc(prepared_html, out_docx_tmp, pandoc_opts)
+            except Exception as e:
+                logger.error("Pandoc feilet: %s", e)
+                return 1
+
+            if not out_docx_tmp.exists():
+                logger.error("Ingen DOCX fra pandoc.")
+                return 1
+
+            # clean
+            try:
+                doc = Document(str(out_docx_tmp))
+                doc = clean_document(doc, clean_args, logger)
+            except Exception as e:
+                logger.error("DOCX-etterbehandling feilet: %s", e)
+                return 1
+
+            # Bestem endelig output
+            if args.stdout:
+                bio = io.BytesIO()
+                doc.save(bio)
+                sys.stdout.buffer.write(bio.getvalue())
+                return 0
+
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                doc.save(str(args.output))
+                logger.info("Skrev %s", args.output)
+                return 0
+
+            # Default: lag mappen output/<production_number>/, og lag filnavn ut fra tittel
+            production_number = actual_xhtml.stem
+            out_dir = OUTPUT_DIR / production_number
+            if out_dir.exists():
+                logger.info("Fjerner gammel output-mappe: %s", out_dir)
+                shutil.rmtree(out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            title = _derive_title(doc)
+            final_name = f"{title} {actual_xhtml.with_suffix('.docx').name}"
+            final_path = out_dir / final_name
+            doc.save(str(final_path))
+            logger.info("Skrev %s", final_path)
+            return 0
+
+    logger.error("Ukjent kommando.")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
