@@ -1,39 +1,51 @@
+# Slank Python-base
 FROM python:3.12-slim
 
+# --- Miljø ---
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     MODULE_NAME=bok_to_docx \
-    PORT=9004 \
     APP_HOME=/app \
     PIP_NO_CACHE_DIR=1 \
-    PIP_PREFER_BINARY=1
+    PIP_PREFER_BINARY=1 \
+    BOK_TO_DOCX_PORT=39015 \
+    LOG_LEVEL=INFO
 
 WORKDIR ${APP_HOME}
 
-# Systemavhengigheter: pandoc for konvertering
+# --- Systemavhengigheter ---
+# Pandoc trengs for konverteringen (bok_to_docx → DOCX)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pandoc \
  && rm -rf /var/lib/apt/lists/*
 
-# Python-avhengigheter
-COPY requirements.txt ./requirements.txt
-RUN pip install --upgrade pip setuptools wheel \
- && pip install -r requirements.txt
+# --- Python-avhengigheter ---
+# Bruk lag-cache: kopier kun requirements først
+COPY requirements.txt /tmp/requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r /tmp/requirements.txt \
+ && rm -f /tmp/requirements.txt
 
-# Kildekode
-COPY app.py ./app.py
-COPY bok2docx.py ./bok2docx.py
-# Hjelpemoduler fra repoet ditt:
-COPY clean.py ./clean.py
-COPY pandoc_wrapper.py ./pandoc_wrapper.py
-COPY prepareXdocx.py ./prepareXdocx.py
+# --- App-kode ---
+# Kopierer hele repoet (app.py, bok_to_docx.py, statiske filer, osv.)
+COPY . .
 
-# Ikke-root
-RUN useradd -ms /bin/bash appuser
+# Sikre at kataloger finnes (brukes av app/konverterer)
+RUN mkdir -p ${APP_HOME}/static ${APP_HOME}/output
+
+# --- Non-root ---
+# UID 10001 som i andre moduler; gi skrivetilgang til appen
+RUN useradd -m -u 10001 appuser \
+ && chown -R appuser:appuser ${APP_HOME}
 USER appuser
 
-EXPOSE 9004
+# --- Nett/Health ---
+EXPOSE 39015
 HEALTHCHECK --interval=20s --timeout=3s --retries=5 \
-  CMD python -c "import socket; s=socket.create_connection(('127.0.0.1', 9004), 2); s.close()"
+  CMD python -c "import socket; s=socket.create_connection(('127.0.0.1', 39015), 3); s.close()"
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "9004"]
+# --- Start ---
+# Holder samme stil som referansemodulene (fast port i CMD).
+# (Du kan fortsatt mappe valgfri port i docker compose.)
+# CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "39015"]
+CMD ["/bin/sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${BOK_TO_DOCX_PORT:-39015}"]
