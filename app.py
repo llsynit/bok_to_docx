@@ -1,314 +1,387 @@
-from __future__ import annotations
-
+# app.py
 import os
-import io
+import shutil
+import time
 import uuid
-import asyncio
-import logging
 import tempfile
-from contextlib import suppress
-from datetime import datetime
+import io
+import re
+import logging
+import sys
 from pathlib import Path
-from typing import Optional, List
+from typing import Dict, Optional
+from urllib.parse import urlparse
+from datetime import datetime
 
 import aio_pika
 import httpx
-from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
-# =============================================================================
-# Import converter (prefer bok_to_docx; fallback to bok2docx)
-# =============================================================================
-try:
-    import bok_to_docx as converter
-except Exception:
-    try:
-        import bok2docx as converter  # older name
-    except Exception as e:
-        raise RuntimeError(
-            "Finner verken 'bok_to_docx' eller 'bok2docx'. "
-            "Sørg for at konverterer-filen ligger i repoet."
-        ) from e
+from aiormq.exceptions import AMQPConnectionError
+from contextlib import suppress
+import asyncio
 
-# =============================================================================
-# Konfigurasjon via miljøvariabler
-# =============================================================================
-MODULE_NAME = os.getenv("MODULE_NAME", "bok_to_docx")
-PORT = int(os.getenv("BOK_TO_DOCX_PORT", "39015"))
-BASE_URL = os.getenv("BASE_URL", f"http://localhost:{PORT}")
+from bok2docx import convert  # your existing validator
+from utils.utils import cleanup_artifacts_once
 
-# AMQP (valgfritt)
-AMQP_URL = os.getenv("RABBITMQ_URL", os.getenv("AMQP_URL", ""))
-AMQP_QUEUE = os.getenv("BOK_TO_DOCX_QUEUE", "bok_to_docx")
-AMQP_PREFETCH = int(os.getenv("AMQP_PREFETCH", "2"))
-
-# Logging
-DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, DEFAULT_LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+from config import (
+    MODULE_NAME, PORT,
+    RABBITMQ_URL,
+    WORK_EXCHANGE, RESULTS_EXCHANGE, WORK_ROUTING_KEY, WORK_QUEUE_NAME,
+    ARTIFACTS_ROOT, WORKER_BASE_URL, ARTIFACTS_RETENTION_HOURS, ARTIFACTS_CLEAN_INTERVAL_SEC
 )
-logger = logging.getLogger(MODULE_NAME)
+
+# -----------------------------------------------------------------------------
+# Logger
+# -----------------------------------------------------------------------------
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 logging.getLogger("aio_pika").setLevel(logging.WARNING)
 logging.getLogger("aiormq").setLevel(logging.WARNING)
 
-# Paths
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-OUTPUT_DIR = BASE_DIR / "output"
-OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+
+uid = "bok_to_docx"
+
+logger.info(f"Starting {MODULE_NAME} on port {PORT}.....")
+
 
 # =============================================================================
-# FastAPI app
+# FastAPI
 # =============================================================================
-app = FastAPI(title=MODULE_NAME, version="1.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[os.getenv("CORS_ALLOW_ORIGINS", "*")],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title=MODULE_NAME, version="2.0.0", debug=True)
+DOWNLOADS: Dict[str, bytes] = {}
+
+
+app.state.amqp_enabled = False
+app.state.amqp_conn = None
+app.state.amqp_ch = None
+app.state._amqp_reconnector_task = None  # background task handle
+RECONNECT_DELAY_SECONDS = 30
+
+# Serve ephemeral artifacts (no persistent volume!)
+app.mount("/artifacts", StaticFiles(directory=str(ARTIFACTS_ROOT)),
+          name="artifacts")
 
 # =============================================================================
-# Hjelpere
+# Small helpers
 # =============================================================================
-def _bool_env(val: str | None) -> bool:
-    if not val:
-        return False
-    return val.strip().lower() in {"1", "true", "yes", "on"}
 
-def _pandoc_available() -> bool:
-    pandoc_bin = os.getenv("PANDOC_BIN", "pandoc")
-    from shutil import which
-    return which(pandoc_bin) is not None
 
-def _safe_filename(name: str, fallback: str = "output.docx") -> str:
-    name = name.strip().replace("/", "_").replace("\\", "_")
-    return name or fallback
+async def _http_download_to(dst: Path, url: str):
+    """Download http(s) or copy file:// to dst"""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    u = urlparse(url)
+    if u.scheme in ("http", "https"):
+        async with httpx.AsyncClient(timeout=120) as http:
+            r = await http.get(url)
+            r.raise_for_status()
+            dst.write_bytes(r.content)
+    elif u.scheme == "file":
+        src = Path(u.path)
+        if not src.exists():
+            raise FileNotFoundError(f"file:// source not found: {src}")
+        dst.write_bytes(src.read_bytes())
+    else:
+        raise HTTPException(400, f"Unsupported URI scheme: {u.scheme}")
 
-def _guess_reference_docx(req_ref: Optional[str]) -> Optional[Path]:
-    if req_ref:
-        p = Path(req_ref)
-        if p.exists():
-            return p
-    candidate = STATIC_DIR / "referenceDoc.docx"
-    if candidate.exists():
-        return candidate
-    return None
 
-async def _convert_bytes(
-    xhtml_bytes: bytes,
-    *,
-    output_filename: str = "output.docx",
-    reference_docx: Optional[str | Path] = None,
-    pandoc_args: Optional[List[str]] = None,
-    grade: Optional[int] = None,
-    mathematics: bool = False,
-    science: bool = False,
-    toc_levels: Optional[int] = None,
-    no_excel: bool = False,
-) -> bytes:
-    ref = None
-    if reference_docx:
-        ref = Path(reference_docx)
-    elif (STATIC_DIR / "referenceDoc.docx").exists():
-        ref = STATIC_DIR / "referenceDoc.docx"
+def _art_uri(job_id: str,  name: str) -> str:
+    return f"{WORKER_BASE_URL}/artifacts/{job_id}/{name}"
 
-    return converter.xhtml_to_docx(
-        xhtml_bytes,
-        output_filename=_safe_filename(output_filename, "output.docx"),
-        reference_docx=ref,
-        pandoc_args=pandoc_args or (),
-        grade=grade,
-        mathematics=mathematics,
-        science=science,
-        toc_levels=toc_levels,
-        no_excel=no_excel,
+
+async def _publish_result(stage: str, job_id: str, status: str, artifacts: Dict, correlation_id: Optional[str]):
+    rk = f"job.{job_id}.stage.{stage}.status.{status}"
+    payload = {
+        "job_id": job_id,
+        "stage": stage,
+        "status": status,          # "ok" | "fail"
+        "artifacts": artifacts,    # URIs (ephemeral here)
+        "finished_at": time.time()
+    }
+    body = __import__("json").dumps(
+        payload, ensure_ascii=False).encode("utf-8")
+    msg = aio_pika.Message(
+        body=body,
+        content_type="application/json",
+        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+        correlation_id=correlation_id,
+        message_id=str(uuid.uuid4()),
     )
+    await app.state.results_ex.publish(msg, routing_key=rk)
 
 # =============================================================================
-# API Endepunkter
+# HTTP API (kept for manual testing)
 # =============================================================================
-@app.get("/", response_class=JSONResponse)
-async def root():
-    return {
-        "module": MODULE_NAME,
-        "status": "ok",
-        "time": datetime.utcnow().isoformat() + "Z",
-        "base_url": BASE_URL,
-        "pandoc_available": _pandoc_available(),
-        "version": app.version,
-        "static_referenceDoc": str(STATIC_DIR / "referenceDoc.docx")
-            if (STATIC_DIR / "referenceDoc.docx").exists() else None,
-        "amqp_enabled": bool(AMQP_URL),
-        "queue": AMQP_QUEUE if AMQP_URL else None,
-    }
 
-@app.get("/health", response_class=JSONResponse)
-async def health():
-    return {
-        "status": "ok",
-        "pandoc": _pandoc_available(),
-        "time": datetime.utcnow().isoformat() + "Z",
-    }
 
-@app.get("/version", response_class=PlainTextResponse)
-async def version():
-    return app.version
+@app.get("/health")
+def health():
+    return {"status": True, "module": MODULE_NAME}
 
-# --- POST /convert -----------------------------------------------------------
-@app.post("/convert")
-async def convert_endpoint(
-    # JSON-variant
-    xhtml: Optional[str] = Body(default=None),
-    reference_docx: Optional[str] = Body(default=None),
-    pandoc_args: Optional[List[str]] = Body(default=None),
-    grade: Optional[int] = Body(default=None),
-    mathematics: bool = Body(default=False),
-    science: bool = Body(default=False),
-    toc_levels: Optional[int] = Body(default=None),
-    no_excel: bool = Body(default=False),
-    output_filename: Optional[str] = Body(default=None),
+# TODO: update for relevant conversion
 
-    # Alternativ: multipart opplasting
-    file: Optional[UploadFile] = File(default=None),
-
-    # Query-valg
-    download: bool = Query(default=True, description="Sett Content-Disposition for nedlasting"),
+@app.post("/run")
+async def run(
+    request: Request,
+    xhtml: UploadFile = File(...),
 ):
     """
-    Konverterer XHTML → DOCX.
-    Støtter både JSON (feltet 'xhtml') og multipart (feltet 'file').
+    Manual test endpoint — not used by RabbitMQ flow.
+    Returns a zip file (validator's original behavior).
     """
-    if not _pandoc_available():
-        raise HTTPException(status_code=500, detail="Pandoc ikke tilgjengelig (sett PANDOC_BIN eller legg pandoc i PATH).")
+    t0 = time.time()
+    # Get original filename
+    original_name = xhtml.filename or ""
+    suffix = Path(xhtml.filename or "").suffix or ".xhtml"
+    # Extract production_number from filename (basename without extension)
+    production_number = Path(original_name).stem
 
-    # Innhent bytes
-    if xhtml is not None:
-        data = xhtml.encode("utf-8")
-        inferred_name = output_filename or "output.docx"
-    elif file is not None:
-        data = await file.read()
-        inferred_name = output_filename or (Path(file.filename or "output").with_suffix(".docx").name)
-    else:
-        raise HTTPException(status_code=400, detail="Mangler input: send 'xhtml' i JSON eller 'file' i multipart.")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", production_number)
+    tmp_path = Path(tempfile.gettempdir()) / f"{safe_name}{suffix}"
+    with open(tmp_path, "wb") as f:
+        f.write(await xhtml.read())
 
-    ref = _guess_reference_docx(reference_docx)
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S%f")
+    job_id = f"{production_number}-{timestamp}"
+
     try:
-        result = await _convert_bytes(
-            data,
-            output_filename=inferred_name,
-            reference_docx=str(ref) if ref else None,
-            pandoc_args=pandoc_args,
-            grade=grade,
-            mathematics=mathematics,
-            science=science,
-            toc_levels=toc_levels,
-            no_excel=no_excel,
-        )
-    except Exception as e:
-        logger.exception("Konvertering feilet")
-        raise HTTPException(status_code=500, detail=f"Konvertering feilet: {e}")
+        status = convert(tmp_path, str(production_number), job_id)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+    logger.info("Validation completed, preparing artifacts...")
+    job_dir = ARTIFACTS_ROOT / job_id
+    logger.info(f"Job dir: {job_dir}")
 
-    headers = {}
-    if download:
-        headers["Content-Disposition"] = f'attachment; filename="{_safe_filename(inferred_name)}"'
+    if not os.path.isdir(job_dir):
+        logger.warning(
+            f"Could not find artifact folder for this job: {job_dir}")
+        raise HTTPException(
+            500, f"Could not find artifact folder for this job: {job_dir}")
 
+    # Zip the folder to a temp file for download
+    zip_base = os.path.join(tempfile.gettempdir(), f"{job_id}")
+    # returns path/to/<base>.zip
+    zip_path = shutil.make_archive(zip_base, "zip", job_dir)
+
+    headers = {
+        "X-Validation-Status": status.get("status"),
+        "X-Processing-Time-ms": str(int((time.time() - t0) * 1000)),
+    }
+    download_name = f"{production_number}-artifacts.zip"
+    return FileResponse(zip_path, media_type="application/zip", filename=download_name, headers=headers)
+
+
+@app.get("/download/{token}")
+async def download(token: str):
+    data = DOWNLOADS.pop(token, None)
+    if data is None:
+        return JSONResponse(status_code=404, content={"error": "File not found"})
     return StreamingResponse(
-        io.BytesIO(result),
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers=headers,
+        io.BytesIO(data),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename=\"result.zip\"'},
     )
 
-# --- Enkelt GET for å teste at appen svarer, og for å se porten -------------
-@app.get("/info", response_class=JSONResponse)
-async def info():
-    return {
-        "module": MODULE_NAME,
-        "port": PORT,
-        "base_url": BASE_URL,
-        "time": datetime.utcnow().isoformat() + "Z",
+# =============================================================================
+# RabbitMQ consumer
+# =============================================================================
+
+
+async def _handle_work_message(m: aio_pika.IncomingMessage):
+    """
+    Expected message body (JSON) from controller:
+    {
+      "job_id": "...",
+      "production_number": "...",
+      "stage": "nordic_to_bok",
+      "inputs": { "xhtml": "http://controller:7000/downloads/<prod>/<file>.xhtml" },
+      "correlation_id": "job::<id>::nordic_to_bok::1",
+      ...
     }
+    """
+    async with m.process():
+        data = __import__("json").loads(m.body.decode("utf-8"))
+        job_id = data.get("job_id")
+        stage = data.get("stage") or "bok_to_docx"
+        inputs = data.get("inputs") or {}
+        corr_id = data.get("correlation_id") or m.correlation_id
+        production_number = str(data.get("production_number") or "")
 
-# =============================================================================
-# AMQP (valgfritt): Konsument av jobber fra kø
-# =============================================================================
-async def _amqp_consumer_loop(conn: aio_pika.RobustConnection):
-    ch: aio_pika.RobustChannel = await conn.channel()
-    await ch.set_qos(prefetch_count=AMQP_PREFETCH)
-    q = await ch.declare_queue(AMQP_QUEUE, durable=True)
+        xhtml_uri = inputs.get("xhtml_uri")
+        if not (job_id and xhtml_uri and production_number):
+            await _publish_result(stage, job_id or "?", "fail",
+                                  {"error": "missing job_id/xhtml_uri/production_number"}, corr_id)
+            return
 
-    logger.info("AMQP: Lytter på kø: %s", AMQP_QUEUE)
+        # Workspace (EPHEMERAL)
+        job_dir = ARTIFACTS_ROOT / job_id
+        # job_dir.mkdir(parents=True, exist_ok=True)
+        tmp_xhtml = job_dir / "input.xhtml"
 
-    async with q.iterator() as queue_iter:
-        async for msg in queue_iter:
-            async with msg.process():
-                try:
-                    job_id = msg.message_id or str(uuid.uuid4())
-                    logger.info("AMQP: mottok job %s", job_id)
-                    payload = msg.body.decode("utf-8", errors="replace")
+        # 1) Fetch xhtml
+        await _http_download_to(tmp_xhtml, xhtml_uri)
 
-                    # Forventer rå XHTML i body. Alternativt kunne vi støttet JSON.
-                    result = await _convert_bytes(
-                        payload.encode("utf-8"),
-                        output_filename=f"{job_id}.docx",
-                        reference_docx=str(_guess_reference_docx(None) or ""),
-                        pandoc_args=None,
-                    )
+        # 2) Run nordic_to_bok
+        try:
+            status = convert(str(tmp_xhtml), production_number, job_id)
+        except Exception as e:
+            # crash → publish fail
+            artifacts = {"error": f"{uid} crashed: {e}"}
+            await _publish_result(stage, job_id, "fail", artifacts, corr_id)
+            try:
+                tmp_xhtml.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        finally:
+            try:
+                tmp_xhtml.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-                    # Publiser svar på reply_to hvis satt, ellers dropp (fire-and-forget)
-                    if msg.reply_to:
-                        await ch.default_exchange.publish(
-                            aio_pika.Message(
-                                body=result,
-                                correlation_id=msg.correlation_id,
-                                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            ),
-                            routing_key=msg.reply_to,
-                        )
-                        logger.info("AMQP: publiserte svar for job %s", job_id)
-                except Exception:
-                    logger.exception("AMQP: feil ved behandling av melding")
+        if not os.path.isdir(job_dir):
+            await _publish_result(stage, job_id, "fail",
+                                  {"error": f"Could not find artifact folder for this job: {job_dir}"},
+                                  corr_id)
+            return
+        artifacts = {}
+        # Build artifact URIs (use relative names under job_dir)
+        # Go through all content of job_dir and create URIs for them ignore images folder
+        for path in job_dir.rglob("*"):
+            # do not ignore images 20.10.25
+            #if path.is_file() and "images" not in str(path):
+                # use name of the file as key and add to artifacts dict
+            artifacts[str(path.relative_to(job_dir))] = _art_uri(
+                job_id, str(path.relative_to(job_dir)))
+
+        # Normalize status to "ok"/"fail"
+        if isinstance(status, dict):
+            status_value = status.get("status")
+        else:
+            status_value = "ok" if status else "fail"
+
+        logger.info("Publishing result to controller...")
+        logger.info(
+            f"[{MODULE_NAME}] job {job_id} stage {stage} completed, status: {status_value}")
+        await _publish_result(stage, job_id, status_value, artifacts, corr_id)
+
+
+async def _amqp_reconnector_loop():
+    """
+    Optional: background loop to try reconnecting periodically.
+    Never raises. Stops when app shuts down.
+    """
+    while True:
+        if app.state.amqp_enabled:
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+            continue
+
+        ok = await _setup_amqp_once()
+        if ok:
+            # Connected; loop keeps running in case it drops later.
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+        else:
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+
+
+async def _setup_amqp_once():
+    try:
+        # AMQP connect
+        app.state.amqp_conn = await aio_pika.connect_robust(RABBITMQ_URL)
+        ch = await app.state.amqp_conn.channel()
+        await ch.set_qos(prefetch_count=1)
+        app.state.amqp_ch = ch
+
+        # Exchanges
+        app.state.work_ex = await ch.declare_exchange(WORK_EXCHANGE, aio_pika.ExchangeType.DIRECT, durable=True)
+        app.state.results_ex = await ch.declare_exchange(RESULTS_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True)
+
+        # Queue + bind
+        q = await ch.declare_queue(WORK_QUEUE_NAME, durable=True)
+        await q.bind(app.state.work_ex, routing_key=WORK_ROUTING_KEY)
+
+        # Start consuming
+        await q.consume(_handle_work_message)
+        logger.info(
+            f"[{MODULE_NAME}] consuming: exchange='{WORK_EXCHANGE}' rk='{WORK_ROUTING_KEY}' queue='{WORK_QUEUE_NAME}'")
+        return True
+    except (AMQPConnectionError, OSError, ConnectionRefusedError) as e:
+        # Log as WARNING (not ERROR) so app continues running
+        logger.warning(
+            "[%s] AMQP connection failed (%s). Running without RabbitMQ. "
+            "HTTP endpoints remain available.",
+            MODULE_NAME, repr(e)
+        )
+        # Ensure disabled state
+        app.state.amqp_enabled = False
+        app.state.amqp_conn = None
+        app.state.amqp_ch = None
+        return False
+
+
+async def _cleanup_loop():
+    """
+    Periodically clean up old artifacts. Never raises.
+    """
+    while True:
+        try:
+            stats = cleanup_artifacts_once(
+                ARTIFACTS_ROOT, ARTIFACTS_RETENTION_HOURS, logger)
+            logger.debug("Artifacts cleanup stats: %s", stats)
+        except Exception as e:
+            logger.warning("Artifacts cleanup loop error: %r", e)
+        await asyncio.sleep(ARTIFACTS_CLEAN_INTERVAL_SEC)
+
 
 @app.on_event("startup")
 async def on_startup():
-    app.state.tasks: list[asyncio.Task] = []
+    # Try once, but do NOT crash the app if it fails
+    ok = await _setup_amqp_once()
+    if not ok:
+        # Optionally, start a background reconnector
+        app.state._amqp_reconnector_task = asyncio.create_task(
+            _amqp_reconnector_loop())
 
-    if AMQP_URL:
-        try:
-            conn = await aio_pika.connect_robust(AMQP_URL)
-            app.state.amqp_conn = conn
-            task = asyncio.create_task(_amqp_consumer_loop(conn))
-            app.state.tasks.append(task)
-            logger.info("AMQP: tilkoblet %s, kø=%s", AMQP_URL, AMQP_QUEUE)
-        except Exception:
-            logger.exception("AMQP: klarte ikke koble til")
+    logger.info("Starting artifacts cleanup loop...")
+    app.state._cleanup_task = asyncio.create_task(_cleanup_loop())
+
 
 @app.on_event("shutdown")
-async def on_shutdown():
-    # stop tasks
-    for t in getattr(app.state, "tasks", []):
-        t.cancel()
+async def shutdown():
+    # stop cleanup loop
+    task = getattr(app.state, "_cleanup_task", None)
+    if task:
+        task.cancel()
         with suppress(asyncio.CancelledError):
-            await t
+            await task
 
-    # close AMQP
+    # stop amqp reconnector loop (if it was started)
+    task = getattr(app.state, "_amqp_reconnector_task", None)
+    if task:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    # close AMQP channel/connection if present
     ch = getattr(app.state, "amqp_ch", None)
     if ch:
         with suppress(Exception):
             await ch.close()
+
     conn = getattr(app.state, "amqp_conn", None)
     if conn:
         with suppress(Exception):
             await conn.close()
-
-# =============================================================================
-# Lokal kjøring (uvicorn)
-# =============================================================================
-if __name__ == "__main__":
-    import uvicorn
-    logger.info("Starter %s på port %s ...", MODULE_NAME, PORT)
-    uvicorn.run("app:app", host="0.0.0.0", port=PORT, log_level=DEFAULT_LOG_LEVEL.lower())
