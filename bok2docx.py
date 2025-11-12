@@ -98,6 +98,7 @@ def configure_logging(level: str = DEFAULT_LOG_LEVEL) -> None:
 
 logger = logging.getLogger("bok_to_docx")
 
+
 # ==============================================================================
 # 1) PREPARE (tidligere prepareXdocx.py — forkortet/robustifisert)
 # ==============================================================================
@@ -164,7 +165,7 @@ def _prepend_blank_line(soup, element):
     element.insert_before(empty_p)
 
 
-def prepare_soup(soup: BeautifulSoup, args: ArgumentParser, logger: logging.Logger) -> BeautifulSoup:
+def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
     print(args)
     """
     Forbered HTML/XHTML for Pandoc/DOCX:
@@ -179,7 +180,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser, logger: logging.Logg
     # Moved to statpub_to_bok
     '''
     # 4.12 – sidetall (epub:type=pagebreak) → ‘--- <id|title>’
-    logger.info("4.12 Sidetall")
+    args.logger.info("4.12 Sidetall")
     for pagebreak in soup(attrs={"epub:type": "pagebreak"}):
         insert_after = pagebreak
         p = soup.new_tag("p")
@@ -209,14 +210,14 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser, logger: logging.Logg
     # Moved to statpub_to_bok
     '''
     # 4.14 – blank linje over innholdsfortegnelse/frontmatter toc
-    logger.info("4.14 Blank linje over innholdsfortegnelse")
+    args.logger.info("4.14 Blank linje over innholdsfortegnelse")
     toc = soup.find("section", attrs={"epub:type": ["frontmatter toc", "toc", "frontmatter"]})
     if toc:
         if toc.previous_sibling and getattr(toc.previous_sibling, "name", None):
             _prepend_blank_line(soup, toc)
 
     # Blank linje over overskrifter, unntatt når overskrifter følger rett etter hverandre
-    logger.info("4.14 Blank linje over overskrifter")
+    args.logger.info("4.14 Blank linje over overskrifter")
     for h in soup.find_all(re.compile(r"^h[1-6]$")):
         prev = h.find_previous_sibling()
         if prev and getattr(prev, "name", None) and not re.match(r"^h[1-6]$", prev.name or ""):
@@ -224,7 +225,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser, logger: logging.Logg
     '''
 
     # Bilder/figurer → “Bilde: <alt>”
-    logger.info("8.x Bilder/figurer")
+    args.logger.info("8.x Bilder/figurer")
     for fig in soup.find_all("figure"):
         # Finn img/alt
         alt = None
@@ -251,7 +252,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser, logger: logging.Logg
             img.decompose()
 
     # Lister: legg inn logiske innrykk ved hjelp av TOINN
-    logger.info("4.x Lister → innrykk med TOINN")
+    args.logger.info("4.x Lister → innrykk med TOINN")
     for li in soup.find_all("li"):
         depth = sum(1 for p in li.parents if getattr(p, "name", None) in ("ul", "ol"))
         if depth > 0:
@@ -260,7 +261,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser, logger: logging.Logg
     # Moved to statpub_to_bok
     '''
     # Oppgavetegn “>>>” → blank linje foran og etter
-    logger.info("4.1 Blank linje rundt oppgaver (>>>)")
+    args.logger.info("4.1 Blank linje rundt oppgaver (>>>)")
     for p in soup.find_all("p"):
         text = p.get_text(strip=True)
         if text.startswith(">>>"):
@@ -275,7 +276,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser, logger: logging.Logg
 
     # Excel-lignende tabeller: trekk dem ut (om ikke slått av)
     if not args.no_excel:
-        logger.info("Tabeller: Excel-sjekk og mulig utskilling")
+        args.logger.info("Tabeller: Excel-sjekk og mulig utskilling")
         excel_root = OUTPUT_DIR / EXCEL_DIRNAME
         if excel_root.exists():
             shutil.rmtree(excel_root)
@@ -412,7 +413,7 @@ class PandocOptions:
     extra_flags: Sequence[str] = ()
 
 
-def run_pandoc(input_path: Path, output_path: Path, opts: PandocOptions) -> None:
+def run_pandoc(args, input_path: Path, output_path: Path, opts: PandocOptions) -> None:
     """
     Kjører pandoc for å lage DOCX av XHTML/HTML.
     Søker default etter static/referenceDoc.docx hvis ikke eksplisitt oppgitt.
@@ -438,7 +439,7 @@ def run_pandoc(input_path: Path, output_path: Path, opts: PandocOptions) -> None
     if opts.extra_flags:
         cmd.extend(list(opts.extra_flags))
 
-    logger.info("Kjører pandoc: %s", " ".join(cmd))
+    args.logger.info("Kjører pandoc: %s", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError as e:
@@ -480,7 +481,7 @@ class CleanArgs:
     grade: Optional[int] = None
 
 
-def clean_document(document: Document, args: CleanArgs, logger: logging.Logger) -> Document:
+def clean_document(document: Document, args: CleanArgs) -> Document:
     """
     Rydder i DOCX-innholdet:
       - EMPTY_LINE → blank avsnitt (men unngå doble)
@@ -494,7 +495,7 @@ def clean_document(document: Document, args: CleanArgs, logger: logging.Logger) 
     font_name = FONT_NAME_JUNIOR if grade <= 7 else FONT_NAME_SENIOR
     font_size = FONT_SIZE_JUNIOR if grade <= 7 else FONT_SIZE_SENIOR
 
-    logger.info("Rydder DOCX …")
+    args.logger.info("Rydder DOCX …")
 
     for i, p in enumerate(list(document.paragraphs)):
         text = p.text or ""
@@ -574,12 +575,12 @@ def _read_soup_from_input(input_path: Path) -> tuple[BeautifulSoup, Path]:
         if not xhtml_files:
             raise FileNotFoundError(f"Fant ingen .xhtml i {input_path}")
         if len(xhtml_files) > 1:
-            logger.warning("Fant flere .xhtml-filer, bruker: %s", xhtml_files[0].name)
+            args.logger.warning("Fant flere .xhtml-filer, bruker: %s", xhtml_files[0].name)
         target = xhtml_files[0]
     else:
         target = input_path
         if target.suffix.lower() not in {".xhtml", ".html", ".htm"}:
-            logger.warning("Input ser ikke ut som XHTML/HTML: %s", target.name)
+            args.logger.warning("Input ser ikke ut som XHTML/HTML: %s", target.name)
 
     with target.open("rb") as f:
         data = f.read()
@@ -619,7 +620,7 @@ def xhtml_to_docx(
 
         # prepare
         soup = BeautifulSoup(xhtml_bytes, "lxml-xml")
-        prepared = prepare_soup(soup, args, logger)
+        prepared = prepare_soup(soup, args, args.logger)
         prepared_html = tmp / "prepared.xhtml"
         prepared_html.write_text(str(prepared), encoding="utf-8")
 
@@ -631,7 +632,7 @@ def xhtml_to_docx(
 
         # clean
         doc = Document(str(out_docx))
-        doc = clean_document(doc, clean_args, logger)
+        doc = clean_document(doc, clean_args, args.logger)
 
         # output as bytes
         final_docx = tmp / Path(output_filename).name
@@ -641,11 +642,130 @@ def xhtml_to_docx(
 
 # New convert method
 def convert(args):
-    pass
+    pandoc_opts = PandocOptions(reference_docx=args.reference_docx, extra_flags=args.pandoc_arg or ())
+    clean_args = CleanArgs(grade=args.grade)
+
+    # --- INPUT: fil, mappe, eller stdin
+    if args.input == "-":
+        data = sys.stdin.buffer.read()
+        if not data:
+            args.logger.error("Ingen data på stdin.")
+            return 2
+        out_name = args.output.name if args.output else "output.docx"
+        try:
+            out_bytes = xhtml_to_docx(
+                data, out_name,
+                reference_docx=args.reference_docx,
+                pandoc_args=args.pandoc_arg or (),
+                grade=args.grade,
+                mathematics=args.mathematics,
+                science=args.science,
+                toc_levels=args.toc_levels,
+                no_excel=args.no_excel,
+            )
+        except Exception as e:
+            args.logger.error("Konvertering feilet: %s", e)
+            return 1
+
+        if args.stdout:
+            sys.stdout.buffer.write(out_bytes)
+        else:
+            if not args.output:
+                args.logger.error("Må angi -o/--output hvis ikke --stdout.")
+                return 2
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_bytes(out_bytes)
+            args.logger.info("Skrev %s (%.1f KB)", args.output, len(out_bytes)/1024.0)
+        return 0
+
+    # Fil eller mappe
+    in_path = Path(args.input).expanduser().resolve()
+    if not in_path.exists():
+        args.logger.error("Finner ikke input: %s", in_path)
+        return 2
+
+    try:
+        soup, actual_xhtml = _read_soup_from_input(in_path)
+    except Exception as e:
+        args.logger.error("Klarte ikke lese input: %s", e)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="bok_to_docx_") as tmp_s:
+        tmp = Path(tmp_s)
+
+        # prepare
+        prepared = prepare_soup(soup, args)
+        prepared_html = tmp / (actual_xhtml.name if actual_xhtml.suffix else "prepared.xhtml")
+        prepared_html.write_text(str(prepared), encoding="utf-8")
+
+        # pandoc
+        out_docx_tmp = tmp / ((args.output.name if args.output else actual_xhtml.with_suffix(".docx").name))
+        try:
+            run_pandoc(args, prepared_html, out_docx_tmp, pandoc_opts)
+        except Exception as e:
+            args.logger.error("Pandoc feilet: %s", e)
+            return 1
+
+        if not out_docx_tmp.exists():
+            args.logger.error("Ingen DOCX fra pandoc.")
+            return 1
+
+        # clean
+        try:
+            doc = Document(str(out_docx_tmp))
+            doc = clean_document(doc, args)
+        except Exception as e:
+            args.logger.error("DOCX-etterbehandling feilet: %s", e)
+            return 1
+
+        # Bestem endelig output
+        if args.stdout:
+            bio = io.BytesIO()
+            doc.save(bio)
+            sys.stdout.buffer.write(bio.getvalue())
+            return 0
+
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            doc.save(str(args.output))
+            args.logger.info("Skrev %s", args.output)
+            return 0
+
+        # Default: lag mappen output/<production_number>/, og lag filnavn ut fra tittel
+        production_number = actual_xhtml.stem
+        out_dir = OUTPUT_DIR / production_number
+        if out_dir.exists():
+            args.logger.info("Fjerner gammel output-mappe: %s", out_dir)
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        title = _derive_title(doc)
+        final_name = f"{title} {actual_xhtml.with_suffix('.docx').name}"
+        final_path = out_dir / final_name
+        doc.save(str(final_path))
+        args.logger.info("Skrev %s", final_path)
+        return 0
+
+    args.logger.error("Ukjent kommando.")
+    return 2
 
 # ==============================================================================
 # 5) CLI
 # ==============================================================================
+
+# -----------------------------------------------------------------------------
+# Logger (for CLI)
+# -----------------------------------------------------------------------------
+
+def make_logger() -> logging.Logger:
+    """Logger som skriver til stdout (synlig i docker logs)."""
+    logger = logging.getLogger("bok_to_docx")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        logger.addHandler(h)
+    return logger
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -716,127 +836,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Output .docx",
     )
 
+    print(type(p))
+
+    #p.logger = make_logger()
+
     return p
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
-    configure_logging(args.log_level)
+    args.logger = make_logger()
+    result = convert(args)
 
-    # Sett opp hjelpe-objekter
-    prep_args = PrepareArgs(
-        mathematics=args.mathematics,
-        science=args.science,
-        verbose=(args.log_level == "DEBUG"),
-        toc_levels=args.toc_levels,
-        grade=args.grade,
-        no_excel=args.no_excel,
-    )
-    pandoc_opts = PandocOptions(reference_docx=args.reference_docx, extra_flags=args.pandoc_arg or ())
-    clean_args = CleanArgs(grade=args.grade)
-
-    # --- INPUT: fil, mappe, eller stdin
-    if args.input == "-":
-        data = sys.stdin.buffer.read()
-        if not data:
-            logger.error("Ingen data på stdin.")
-            return 2
-        out_name = args.output.name if args.output else "output.docx"
-        try:
-            out_bytes = xhtml_to_docx(
-                data, out_name,
-                reference_docx=args.reference_docx,
-                pandoc_args=args.pandoc_arg or (),
-                grade=args.grade,
-                mathematics=args.mathematics,
-                science=args.science,
-                toc_levels=args.toc_levels,
-                no_excel=args.no_excel,
-            )
-        except Exception as e:
-            logger.error("Konvertering feilet: %s", e)
-            return 1
-
-        if args.stdout:
-            sys.stdout.buffer.write(out_bytes)
-        else:
-            if not args.output:
-                logger.error("Må angi -o/--output hvis ikke --stdout.")
-                return 2
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_bytes(out_bytes)
-            logger.info("Skrev %s (%.1f KB)", args.output, len(out_bytes)/1024.0)
-        return 0
-
-    # Fil eller mappe
-    in_path = Path(args.input).expanduser().resolve()
-    if not in_path.exists():
-        logger.error("Finner ikke input: %s", in_path)
-        return 2
-
-    try:
-        soup, actual_xhtml = _read_soup_from_input(in_path)
-    except Exception as e:
-        logger.error("Klarte ikke lese input: %s", e)
-        return 2
-
-    with tempfile.TemporaryDirectory(prefix="bok_to_docx_") as tmp_s:
-        tmp = Path(tmp_s)
-
-        # prepare
-        prepared = prepare_soup(soup, args, logger)
-        prepared_html = tmp / (actual_xhtml.name if actual_xhtml.suffix else "prepared.xhtml")
-        prepared_html.write_text(str(prepared), encoding="utf-8")
-
-        # pandoc
-        out_docx_tmp = tmp / ((args.output.name if args.output else actual_xhtml.with_suffix(".docx").name))
-        try:
-            run_pandoc(prepared_html, out_docx_tmp, pandoc_opts)
-        except Exception as e:
-            logger.error("Pandoc feilet: %s", e)
-            return 1
-
-        if not out_docx_tmp.exists():
-            logger.error("Ingen DOCX fra pandoc.")
-            return 1
-
-        # clean
-        try:
-            doc = Document(str(out_docx_tmp))
-            doc = clean_document(doc, clean_args, logger)
-        except Exception as e:
-            logger.error("DOCX-etterbehandling feilet: %s", e)
-            return 1
-
-        # Bestem endelig output
-        if args.stdout:
-            bio = io.BytesIO()
-            doc.save(bio)
-            sys.stdout.buffer.write(bio.getvalue())
-            return 0
-
-        if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            doc.save(str(args.output))
-            logger.info("Skrev %s", args.output)
-            return 0
-
-        # Default: lag mappen output/<production_number>/, og lag filnavn ut fra tittel
-        production_number = actual_xhtml.stem
-        out_dir = OUTPUT_DIR / production_number
-        if out_dir.exists():
-            logger.info("Fjerner gammel output-mappe: %s", out_dir)
-            shutil.rmtree(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        title = _derive_title(doc)
-        final_name = f"{title} {actual_xhtml.with_suffix('.docx').name}"
-        final_path = out_dir / final_name
-        doc.save(str(final_path))
-        logger.info("Skrev %s", final_path)
-        return 0
-
-    logger.error("Ukjent kommando.")
-    return 2
+    match result:
+        case 0:
+            args.logger.info("Ferdig uten feil.")
+        case 1:
+            args.logger.error("Ferdig med feil under konvertering.")
+        case 2:
+            args.logger.error("Ferdig med feil i input eller parametre.")
+        case _:
+            args.logger.error("Ukjent avslutningskode: %s", result)
 
 
 if __name__ == "__main__":

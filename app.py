@@ -37,6 +37,15 @@ from config import (
 # Logger
 # -----------------------------------------------------------------------------
 
+def make_logger() -> logging.Logger:
+    """Logger som skriver til stdout (synlig i docker logs)."""
+    logger = logging.getLogger("bok_to_docx")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        h = logging.StreamHandler()
+        h.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        logger.addHandler(h)
+    return logger
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,6 +142,17 @@ def health():
 @app.post("/run")
 async def run(
     request: Request,
+    file: UploadFile = File(..., description="XHTML fra forrige steg i pipelinen"),
+    # Felter som controlleren allerede sender (noen er ikke brukt her, men tillates for kompatibilitet):
+    mathematics: bool = Form(False),
+    science: bool = Form(False),
+    grade: Optional[int] = Form(None),
+    link_footnotes: bool = Form(False),  # ikke brukt her
+    verbose: bool = Form(False),         # ikke brukt her
+    toc_levels: Optional[int] = Form(None),  # ikke brukt her
+    p_length: Optional[int] = Form(None),    # ikke brukt her
+    relocate: bool = Form(True),
+    llm: bool = Form(False),
     xhtml: UploadFile = File(...),
 ):
     """
