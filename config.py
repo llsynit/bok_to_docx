@@ -2,23 +2,18 @@
 import os
 import socket
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-
-SAXON_JAR = PROJECT_ROOT / "jar" / "saxon-he-9.5.1.5-1.jar"
-JING_JAR = PROJECT_ROOT / "jar" / "jing-20161127.jar"
-XSLT_FOLDER = PROJECT_ROOT / "xslt"
-
-MODULE_NAME = os.getenv("MODULE_NAME_BOK_TO_DOCX", "bok_to_docx")
-PORT = int(os.getenv("PORT_BOK_TO_DOCX", "39015"))
+MODULE_NAME_STATPUB_TO_BOK = os.getenv(
+    "MODULE_NAME_BOK_TO_DOCX", "bok_to_docx")
+PORT_STATPUB_TO_BOK = int(os.getenv("PORT_BOK_TO_DOCX", "39015"))
 
 # RabbitMQ
 
-#RABBITMQ_URL = None
-#RABBITMQ_URL_DOCKER = os.getenv("RABBITMQ_URL_DOCKER")
-#RABBITMQ_URL_LOCAL = os.getenv("RABBITMQ_URL_LOCAL")
-RABBITMQ_URL_DOCKER = "amqp://credentials:credentials@rabbitmq:5672/%2F"
-RABBITMQ_URL_LOCAL = "amqp://credentials:credentials@localhost:5672/%2F"
+RABBITMQ_URL = None
+RABBITMQ_URL_DOCKER = os.getenv("RABBITMQ_URL_DOCKER")
+RABBITMQ_URL_LOCAL = os.getenv("RABBITMQ_URL_LOCAL")
 
 if RABBITMQ_URL_DOCKER:
     try:
@@ -42,23 +37,24 @@ else:
 
 print(f"Connecting to RabbitMQ: {RABBITMQ_URL}")
 
+# RabbitMQ exchanges, queues, routing keys
 
 WORK_EXCHANGE = os.getenv("WORK_EXCHANGE", "work.ex")            # direct
 RESULTS_EXCHANGE = os.getenv("RESULTS_EXCHANGE", "results.ex")   # topic
-WORK_ROUTING_KEY = os.getenv(
+WORK_ROUTING_KEY_STATPUB_TO_BOK = os.getenv(
     "WORK_ROUTING_KEY_BOK_TO_DOCX", "bok_to_docx")     # stage name
-WORK_QUEUE_NAME = os.getenv(
+WORK_QUEUE_NAME_STATPUB_TO_BOK = os.getenv(
     "WORK_QUEUE_NAME_BOK_TO_DOCX", "bok_to_docx.q")     # durable queue
 
 # Artifacts are EPHEMERAL here — the controller should fetch and persist them.
-WORKER_BASE_URL = os.getenv(
-    "WORKER_BASE_URL_N_EPUB_TO_XHTML", f"http://{MODULE_NAME}:{PORT}")
-print(f"Controller fetches artifacts from worker base url: {WORKER_BASE_URL}")
 
+WORKER_BASE_URL = os.getenv(
+    "WORKER_BASE_URL_BOK_TO_DOCX", f"http://{MODULE_NAME_BOK_TO_DOCX}:{PORT_BOK_TO_DOCX}")
+
+print(f"Controller fetchdes artifacts from worker base url: {WORKER_BASE_URL}")
 BASE_DIR = Path(__file__).parent
 ARTIFACTS_ROOT = (BASE_DIR / "artifacts").resolve()
 ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
-
 
 ARTIFACTS_RETENTION_HOURS = int(
     os.getenv("ARTIFACTS_RETENTION_HOURS", "24"))  # default 24h
