@@ -20,14 +20,14 @@ from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from aiormq.exceptions import AMQPConnectionError
-from contextlib import suppress
+from contextlib import suppress, asynccontextmanager
 import asyncio
 
 from bok2docx import convert  # your existing validator
-from utils.utils import cleanup_artifacts_once
+from utils import cleanup_artifacts_once
 
 from config import (
-    MODULE_NAME, PORT,
+    MODULE_NAME_BOK_TO_DOCX, PORT_BOK_TO_DOCX,
     RABBITMQ_URL,
     WORK_EXCHANGE, RESULTS_EXCHANGE, WORK_ROUTING_KEY, WORK_QUEUE_NAME,
     ARTIFACTS_ROOT, WORKER_BASE_URL, ARTIFACTS_RETENTION_HOURS, ARTIFACTS_CLEAN_INTERVAL_SEC
@@ -60,14 +60,14 @@ logging.getLogger("aiormq").setLevel(logging.WARNING)
 
 uid = "bok_to_docx"
 
-logger.info(f"Starting {MODULE_NAME} on port {PORT}.....")
+logger.info(f"Starting {MODULE_NAME_BOK_TO_DOCX} on port {PORT_BOK_TO_DOCX}.....")
 
 
 # =============================================================================
 # FastAPI
 # =============================================================================
 
-app = FastAPI(title=MODULE_NAME, version="2.0.0", debug=True)
+app = FastAPI(title=MODULE_NAME_BOK_TO_DOCX, version="2.0.0", debug=True)
 DOWNLOADS: Dict[str, bytes] = {}
 
 
@@ -135,7 +135,7 @@ async def _publish_result(stage: str, job_id: str, status: str, artifacts: Dict,
 
 @app.get("/health")
 def health():
-    return {"status": True, "module": MODULE_NAME}
+    return {"status": True, "module": MODULE_NAME_BOK_TO_DOCX}
 
 # TODO: update for relevant conversion
 
@@ -295,7 +295,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
 
         logger.info("Publishing result to controller...")
         logger.info(
-            f"[{MODULE_NAME}] job {job_id} stage {stage} completed, status: {status_value}")
+            f"[{MODULE_NAME_BOK_TO_DOCX}] job {job_id} stage {stage} completed, status: {status_value}")
         await _publish_result(stage, job_id, status_value, artifacts, corr_id)
 
 
@@ -336,14 +336,14 @@ async def _setup_amqp_once():
         # Start consuming
         await q.consume(_handle_work_message)
         logger.info(
-            f"[{MODULE_NAME}] consuming: exchange='{WORK_EXCHANGE}' rk='{WORK_ROUTING_KEY}' queue='{WORK_QUEUE_NAME}'")
+            f"[{MODULE_NAME_BOK_TO_DOCX}] consuming: exchange='{WORK_EXCHANGE}' rk='{WORK_ROUTING_KEY}' queue='{WORK_QUEUE_NAME}'")
         return True
     except (AMQPConnectionError, OSError, ConnectionRefusedError) as e:
         # Log as WARNING (not ERROR) so app continues running
         logger.warning(
             "[%s] AMQP connection failed (%s). Running without RabbitMQ. "
             "HTTP endpoints remain available.",
-            MODULE_NAME, repr(e)
+            MODULE_NAME_BOK_TO_DOCX, repr(e)
         )
         # Ensure disabled state
         app.state.amqp_enabled = False
@@ -365,7 +365,7 @@ async def _cleanup_loop():
             logger.warning("Artifacts cleanup loop error: %r", e)
         await asyncio.sleep(ARTIFACTS_CLEAN_INTERVAL_SEC)
 
-
+'''
 @app.on_event("startup")
 async def on_startup():
     # Try once, but do NOT crash the app if it fails
@@ -405,3 +405,52 @@ async def shutdown():
     if conn:
         with suppress(Exception):
             await conn.close()
+
+'''
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic (tidligere @app.on_event("startup"))
+    ok = await _setup_amqp_once()
+    if not ok:
+        # Eventuell bakgrunnsreconnector
+        app.state._amqp_reconnector_task = asyncio.create_task(
+            _amqp_reconnector_loop()
+        )
+
+    logger.info("Starting artifacts cleanup loop...")
+    app.state._cleanup_task = asyncio.create_task(_cleanup_loop())
+
+    try:
+        # Her kjører selve appen
+        yield
+    finally:
+        # Shutdown logic (tidligere @app.on_event("shutdown"))
+
+        # Stopp cleanup-loop
+        task = getattr(app.state, "_cleanup_task", None)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        # Stopp AMQP-reconnector (hvis startet)
+        task = getattr(app.state, "_amqp_reconnector_task", None)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        # Lukk AMQP-kanal/tilkobling
+        ch = getattr(app.state, "amqp_ch", None)
+        if ch:
+            with suppress(Exception):
+                await ch.close()
+
+        conn = getattr(app.state, "amqp_conn", None)
+        if conn:
+            with suppress(Exception):
+                await conn.close()
+
+# Fortell FastAPI at den skal bruke lifespan-handleren
+app.router.lifespan_context = lifespan

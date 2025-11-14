@@ -2,15 +2,20 @@
 import os
 import socket
 from pathlib import Path
-from dotenv import load_dotenv
-load_dotenv()
+from dotenv import load_dotenv, find_dotenv
+# loads .env if present; safe in Docker too
+load_dotenv(find_dotenv(), override=False)
 
-MODULE_NAME_STATPUB_TO_BOK = os.getenv(
-    "MODULE_NAME_BOK_TO_DOCX", "bok_to_docx")
-PORT_STATPUB_TO_BOK = int(os.getenv("PORT_BOK_TO_DOCX", "39015"))
+# =============================================================================
+# Config (env) — no Redis anywhere, pure RabbitMQ
+# =============================================================================
+
+MODULE_NAME_BOK_TO_DOCX = os.getenv("MODULE_NAME_BOK_TO_DOCX", "bok_to_docx")
+PORT_BOK_TO_DOCX = int(os.getenv("PORT_BOK_TO_DOCX", "39015"))
+
+print(f"Starting {MODULE_NAME_BOK_TO_DOCX} on port {PORT_BOK_TO_DOCX}.....")
 
 # RabbitMQ
-
 RABBITMQ_URL = None
 RABBITMQ_URL_DOCKER = os.getenv("RABBITMQ_URL_DOCKER")
 RABBITMQ_URL_LOCAL = os.getenv("RABBITMQ_URL_LOCAL")
@@ -37,21 +42,18 @@ else:
 
 print(f"Connecting to RabbitMQ: {RABBITMQ_URL}")
 
-# RabbitMQ exchanges, queues, routing keys
-
 WORK_EXCHANGE = os.getenv("WORK_EXCHANGE", "work.ex")            # direct
 RESULTS_EXCHANGE = os.getenv("RESULTS_EXCHANGE", "results.ex")   # topic
-WORK_ROUTING_KEY_STATPUB_TO_BOK = os.getenv(
+WORK_ROUTING_KEY = os.getenv(
     "WORK_ROUTING_KEY_BOK_TO_DOCX", "bok_to_docx")     # stage name
-WORK_QUEUE_NAME_STATPUB_TO_BOK = os.getenv(
+WORK_QUEUE_NAME = os.getenv(
     "WORK_QUEUE_NAME_BOK_TO_DOCX", "bok_to_docx.q")     # durable queue
 
 # Artifacts are EPHEMERAL here — the controller should fetch and persist them.
-
 WORKER_BASE_URL = os.getenv(
     "WORKER_BASE_URL_BOK_TO_DOCX", f"http://{MODULE_NAME_BOK_TO_DOCX}:{PORT_BOK_TO_DOCX}")
 
-print(f"Controller fetchdes artifacts from worker base url: {WORKER_BASE_URL}")
+
 BASE_DIR = Path(__file__).parent
 ARTIFACTS_ROOT = (BASE_DIR / "artifacts").resolve()
 ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
