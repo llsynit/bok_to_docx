@@ -312,7 +312,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
     # Issues for grade < 8
     # <ul>
 
-    if args.grade < 8:
+    if args.grade and args.grade < 8:
 
         # UORDNEDE LISTER → div + p med "-- "
         for ul in reversed(soup('ul')):
@@ -397,7 +397,10 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
             if cleaned:
                 span.append(NavigableString(cleaned))
 
-
+    # Remove line breaks in headings indended for PEF
+    for element in soup(attrs={"class":"braille-heading-break"}):
+        element.decompose()
+        # TODO: merge text nodes?
 
     # Returnér et renset BeautifulSoup-objekt (som XML/XHTML)
     return BeautifulSoup(str(soup), "lxml-xml")
@@ -642,7 +645,7 @@ def xhtml_to_docx(
 
 # New convert method
 def convert(args):
-    pandoc_opts = PandocOptions(reference_docx=args.reference_docx, extra_flags=args.pandoc_arg or ())
+    pandoc_opts = PandocOptions(reference_docx=args.reference_docx, extra_flags=args.pandoc_args or ())
     clean_args = CleanArgs(grade=args.grade)
 
     # --- INPUT: fil, mappe, eller stdin
@@ -656,7 +659,7 @@ def convert(args):
             out_bytes = xhtml_to_docx(
                 data, out_name,
                 reference_docx=args.reference_docx,
-                pandoc_args=args.pandoc_arg or (),
+                pandoc_args=args.pandoc_args or (),
                 grade=args.grade,
                 mathematics=args.mathematics,
                 science=args.science,
@@ -787,7 +790,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Referanse-DOCX (overstyrer static/referenceDoc.docx).",
     )
     p.add_argument(
-        "--pandoc-arg",
+        "--pandoc-args",
         action="append",
         default=[],
         help="Ekstra flagg til pandoc (kan gjentas).",
@@ -835,10 +838,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Output .docx",
     )
-
-    print(type(p))
-
-    #p.logger = make_logger()
 
     return p
 
