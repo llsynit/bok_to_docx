@@ -345,7 +345,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
             ul.insert_before(new_div)
             ul.decompose()
 
-        # ORDNEDE LISTER → div + p med "1." / "a." osv.
+        # ORDNEDE LISTER → div + p med '1.' / 'a.' osv.
         for ol in reversed(soup('ol')):
             new_div = soup.new_tag('div')
             type_attr = (ol.get('type') or '').lower()  # f.eks. "a" eller ""
@@ -359,7 +359,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
                     if getattr(child, 'name', None) in ('ul', 'ol'):
                         continue
                     if hasattr(child, 'get_text'):
-                        txt = child.get_text(" ", strip=True)
+                        txt = child.get_text(' ', strip=True)
                     else:
                         txt = str(child).strip()
                     if txt:
@@ -398,9 +398,9 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
                 span.append(NavigableString(cleaned))
 
     # Remove line breaks in headings indended for PEF
-    for element in soup(attrs={"class":"braille-heading-break"}):
+    for element in soup(attrs={'class':'braille-heading-break'}):
         element.decompose()
-        # TODO: merge text nodes?
+        # FIXME: merge text nodes?
 
     # Returnér et renset BeautifulSoup-objekt (som XML/XHTML)
     return BeautifulSoup(str(soup), "lxml-xml")
