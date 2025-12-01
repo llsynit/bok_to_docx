@@ -10,6 +10,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Dict, Optional
+from types import SimpleNamespace
 from urllib.parse import urlparse
 from datetime import datetime
 
@@ -142,7 +143,9 @@ def health():
 @app.post("/run")
 async def run(
     request: Request,
-    file: UploadFile = File(..., description="XHTML fra forrige steg i pipelinen"),
+    #file: UploadFile = File(..., description="XHTML fra forrige steg i pipelinen"),
+    #input: UploadFile = File(..., description="XHTML fra forrige steg i pipelinen"),
+    xhtml: UploadFile = File(..., description="XHTML fra forrige steg i pipelinen"),
     # Felter som controlleren allerede sender (noen er ikke brukt her, men tillates for kompatibilitet):
     mathematics: bool = Form(False),
     science: bool = Form(False),
@@ -153,7 +156,6 @@ async def run(
     p_length: Optional[int] = Form(None),    # ikke brukt her
     relocate: bool = Form(True),
     llm: bool = Form(False),
-    xhtml: UploadFile = File(...),
 ):
     """
     Manual test endpoint — not used by RabbitMQ flow.
@@ -174,8 +176,28 @@ async def run(
     timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S%f")
     job_id = f"{production_number}-{timestamp}"
 
+    # Bygg args-objektet (dot-notasjon) slik apply_requirements forventer
+    args = SimpleNamespace(
+        #file=xhtml_path,
+        #input=xhtml_path,
+        input=str(tmp_path),
+        folders=folders,
+        production_number=production_number,
+        data=data,
+        mathematics=bool(mathematics),
+        science=bool(science),
+        grade=(int(grade) if grade is not None and str(grade).strip() != "" else None),
+        job_id=job_id,
+        job_dir=job_dir,
+        llm=bool(llm),
+        aggressive=bool(False),
+        relocate=bool(relocate),
+        logger=logger,
+    )
+
     try:
-        status = convert(tmp_path, str(production_number), job_id)
+        #status = convert(tmp_path, str(production_number), job_id)
+        status = convert(args)
     finally:
         try:
             os.unlink(tmp_path)
@@ -254,9 +276,35 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
         # 1) Fetch xhtml
         await _http_download_to(tmp_xhtml, xhtml_uri)
 
+
+        # Bygg args-objektet (dot-notasjon) slik convert forventer
+        args = SimpleNamespace(
+            input=xhtml_uri,
+            output=data.get("output", None),
+            log_level=data.get("log-level", "INFO"),
+            folders=data.get("folders", {}),
+            production_number=production_number,
+            data=data,
+            mathematics=bool(data.get("mathematics", False)),
+            science=bool(data.get("science", False)),
+            grade=(int(data.get("grade")) if data.get("grade") is not None else None),
+            reference_docx=data.get("reference_docx", None),
+            pandoc_args=data.get("pandoc_args", []),
+            stdout=data.get("stdout", False),
+            no_excel=data.get("no_excel", False),
+            job_id=job_id,
+            job_dir=job_dir,
+            llm=bool(data.get("llm", False)),
+            toc_levels=data.get("toc_levels", None),
+            aggressive=bool(data.get("aggressive", False)),
+            relocate=bool(data.get("relocate", True)),
+            logger=make_logger(),
+        )
+
         # 2) Run nordic_to_bok
         try:
-            status = convert(str(tmp_xhtml), production_number, job_id)
+            #status = convert(str(tmp_xhtml), production_number, job_id)
+            status = convert(args)
         except Exception as e:
             # crash → publish fail
             artifacts = {"error": f"{uid} crashed: {e}"}
