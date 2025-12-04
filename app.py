@@ -336,11 +336,11 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
             artifacts[str(path.relative_to(job_dir))] = _art_uri(
                 job_id, str(path.relative_to(job_dir)))
 
-        # Normalize status to "ok"/"fail"
+        # Normalize status to "success"/"fail"
         if isinstance(status, dict):
             status_value = status.get("status")
         else:
-            status_value = "ok" if status else "fail"
+            status_value = "success" if not status else "fail"
 
         logger.info("Publishing result to controller...")
         logger.info(

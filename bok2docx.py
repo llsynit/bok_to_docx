@@ -736,15 +736,23 @@ def convert(args):
 
         # Default: lag mappen output/<production_number>/, og lag filnavn ut fra tittel
         production_number = actual_xhtml.stem
+        '''
         out_dir = OUTPUT_DIR / production_number
         if out_dir.exists():
             args.logger.info("Fjerner gammel output-mappe: %s", out_dir)
             shutil.rmtree(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        '''
+
+        if args.job_dir.exists():
+            args.logger.info("Fjerner gammel output-mappe: %s", args.job_dir)
+            shutil.rmtree(args.job_dir)
+        args.job_dir.mkdir(parents=True, exist_ok=True)
 
         title = _derive_title(doc)
         final_name = f"{title} {actual_xhtml.with_suffix('.docx').name}"
-        final_path = out_dir / final_name
+        #final_path = out_dir / final_name
+        final_path = args.job_dir / final_name
         doc.save(str(final_path))
         args.logger.info("Skrev %s", final_path)
         return 0
