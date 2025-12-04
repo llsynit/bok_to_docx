@@ -279,7 +279,8 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
 
         # Bygg args-objektet (dot-notasjon) slik convert forventer
         args = SimpleNamespace(
-            input=xhtml_uri,
+            #input=xhtml_uri,
+            input=tmp_xhtml,
             output=data.get("output", None),
             log_level=data.get("log-level", "INFO"),
             folders=data.get("folders", {}),
