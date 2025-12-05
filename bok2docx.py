@@ -728,11 +728,13 @@ def convert(args):
             sys.stdout.buffer.write(bio.getvalue())
             return 0
 
+        '''
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             doc.save(str(args.output))
             args.logger.info("Skrev %s", args.output)
             return 0
+        '''
 
         # Default: lag mappen output/<production_number>/, og lag filnavn ut fra tittel
         production_number = actual_xhtml.stem
@@ -750,8 +752,9 @@ def convert(args):
         args.job_dir.mkdir(parents=True, exist_ok=True)
 
         title = _derive_title(doc)
-        final_name = f"{title} {actual_xhtml.with_suffix('.docx').name}"
+        #final_name = f"{title} {actual_xhtml.with_suffix('.docx').name}"
         #final_path = out_dir / final_name
+        final_name = f"{production_number}.docx"
         final_path = args.job_dir / final_name
         doc.save(str(final_path))
         args.logger.info("Skrev %s", final_path)
