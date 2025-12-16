@@ -28,10 +28,17 @@ from bok2docx import convert  # your existing validator
 from utils import cleanup_artifacts_once
 
 from config import (
-    MODULE_NAME_BOK_TO_DOCX, PORT_BOK_TO_DOCX,
+    MODULE_NAME_BOK_TO_DOCX,
+    PORT_BOK_TO_DOCX,
     RABBITMQ_URL,
-    WORK_EXCHANGE, RESULTS_EXCHANGE, WORK_ROUTING_KEY, WORK_QUEUE_NAME,
-    ARTIFACTS_ROOT, WORKER_BASE_URL, ARTIFACTS_RETENTION_HOURS, ARTIFACTS_CLEAN_INTERVAL_SEC
+    WORK_EXCHANGE,
+    RESULTS_EXCHANGE,
+    WORK_ROUTING_KEY_BOK_TO_DOCX,
+    WORK_QUEUE_NAME_BOK_TO_DOCX,
+    ARTIFACTS_ROOT,
+    WORKER_BASE_URL,
+    ARTIFACTS_RETENTION_HOURS,
+    ARTIFACTS_CLEAN_INTERVAL_SEC
 )
 
 # -----------------------------------------------------------------------------
@@ -261,6 +268,10 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
         inputs = data.get("inputs") or {}
         corr_id = data.get("correlation_id") or m.correlation_id
         production_number = str(data.get("production_number") or "")
+        logger = make_logger()
+        logger.info(
+            f"[{MODULE_NAME_BOK_TO_DOCX}] job {job_id} stage {stage} started...")
+        logger.info(f'production_number: {production_number}')
 
         xhtml_uri = inputs.get("xhtml_uri")
         if not (job_id and xhtml_uri and production_number):
@@ -299,7 +310,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
             toc_levels=data.get("toc_levels", None),
             aggressive=bool(data.get("aggressive", False)),
             relocate=bool(data.get("relocate", True)),
-            logger=make_logger(),
+            logger=logger,
         )
 
         # 2) Run nordic_to_bok
@@ -365,7 +376,7 @@ async def _amqp_reconnector_loop():
         else:
             await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
-
+'''
 async def _setup_amqp_once():
     try:
         # AMQP connect
@@ -379,13 +390,13 @@ async def _setup_amqp_once():
         app.state.results_ex = await ch.declare_exchange(RESULTS_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True)
 
         # Queue + bind
-        q = await ch.declare_queue(WORK_QUEUE_NAME, durable=True)
-        await q.bind(app.state.work_ex, routing_key=WORK_ROUTING_KEY)
+        q = await ch.declare_queue(WORK_QUEUE_NAME_BOK_TO_DOCX, durable=True)
+        await q.bind(app.state.work_ex, routing_key=WORK_ROUTING_KEY_BOK_TO_DOCX)
 
         # Start consuming
         await q.consume(_handle_work_message)
         logger.info(
-            f"[{MODULE_NAME_BOK_TO_DOCX}] consuming: exchange='{WORK_EXCHANGE}' rk='{WORK_ROUTING_KEY}' queue='{WORK_QUEUE_NAME}'")
+            f"[{MODULE_NAME_BOK_TO_DOCX}] consuming: exchange='{WORK_EXCHANGE}' rk='{WORK_ROUTING_KEY_BOK_TO_DOCX}' queue='{WORK_QUEUE_NAME_BOK_TO_DOCX}'")
         return True
     except (AMQPConnectionError, OSError, ConnectionRefusedError) as e:
         # Log as WARNING (not ERROR) so app continues running
@@ -399,7 +410,93 @@ async def _setup_amqp_once():
         app.state.amqp_conn = None
         app.state.amqp_ch = None
         return False
+'''
 
+async def _setup_amqp_once() -> bool:
+    """
+    Establish AMQP connection, declare exchanges/queue, and start consuming.
+
+    Important:
+    - Must set app.state.amqp_enabled = True on success
+    - Must store consumer_tag so we can cancel on shutdown / reconnect
+    - Should avoid re-registering consumers if already enabled
+    """
+    # If we're already enabled, don't set up again (prevents duplicate consumers)
+    if getattr(app.state, "amqp_enabled", False) and getattr(app.state, "amqp_conn", None):
+        return True
+
+    try:
+        # AMQP connect
+        conn = await aio_pika.connect_robust(RABBITMQ_URL)
+        ch = await conn.channel()
+        await ch.set_qos(prefetch_count=1)
+
+        # Exchanges
+        work_ex = await ch.declare_exchange(
+            WORK_EXCHANGE,
+            aio_pika.ExchangeType.DIRECT,
+            durable=True,
+        )
+        results_ex = await ch.declare_exchange(
+            RESULTS_EXCHANGE,
+            aio_pika.ExchangeType.TOPIC,
+            durable=True,
+        )
+
+        # Queue + bind
+        q = await ch.declare_queue(WORK_QUEUE_NAME_STATPUB_TO_BOK, durable=True)
+        await q.bind(work_ex, routing_key=WORK_ROUTING_KEY_STATPUB_TO_BOK)
+
+        # Start consuming (store the consumer tag!)
+        consumer_tag = await q.consume(_handle_work_message, no_ack=False)
+
+        # Persist state
+        app.state.amqp_conn = conn
+        app.state.amqp_ch = ch
+        app.state.work_ex = work_ex
+        app.state.results_ex = results_ex
+        app.state.work_q = q
+        app.state.work_consumer_tag = consumer_tag
+        app.state.amqp_enabled = True
+
+        logger.info(
+            "[%s] consuming: exchange='%s' rk='%s' queue='%s'",
+            MODULE_NAME_STATPUB_TO_BOK,
+            WORK_EXCHANGE,
+            WORK_ROUTING_KEY_STATPUB_TO_BOK,
+            WORK_QUEUE_NAME_STATPUB_TO_BOK,
+        )
+        return True
+
+    except (AMQPConnectionError, OSError, ConnectionRefusedError) as e:
+        logger.warning(
+            "[%s] AMQP connection failed (%s). Running without RabbitMQ. "
+            "HTTP endpoints remain available.",
+            MODULE_NAME_STATPUB_TO_BOK, repr(e)
+        )
+
+        # Ensure disabled/clean-ish state (best effort)
+        app.state.amqp_enabled = False
+
+        # Close any partial resources if they exist
+        try:
+            if getattr(app.state, "amqp_ch", None):
+                await app.state.amqp_ch.close()
+        except Exception:
+            pass
+        try:
+            if getattr(app.state, "amqp_conn", None):
+                await app.state.amqp_conn.close()
+        except Exception:
+            pass
+
+        app.state.amqp_conn = None
+        app.state.amqp_ch = None
+        app.state.work_ex = None
+        app.state.results_ex = None
+        app.state.work_q = None
+        app.state.work_consumer_tag = None
+        return False
 
 async def _cleanup_loop():
     """
