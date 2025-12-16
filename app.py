@@ -444,8 +444,8 @@ async def _setup_amqp_once() -> bool:
         )
 
         # Queue + bind
-        q = await ch.declare_queue(WORK_QUEUE_NAME_STATPUB_TO_BOK, durable=True)
-        await q.bind(work_ex, routing_key=WORK_ROUTING_KEY_STATPUB_TO_BOK)
+        q = await ch.declare_queue(WORK_QUEUE_NAME_BOK_TO_DOCX, durable=True)
+        await q.bind(work_ex, routing_key=WORK_ROUTING_KEY_BOK_TO_DOCX)
 
         # Start consuming (store the consumer tag!)
         consumer_tag = await q.consume(_handle_work_message, no_ack=False)
@@ -461,10 +461,10 @@ async def _setup_amqp_once() -> bool:
 
         logger.info(
             "[%s] consuming: exchange='%s' rk='%s' queue='%s'",
-            MODULE_NAME_STATPUB_TO_BOK,
+            MODULE_NAME_BOK_TO_DOCX,
             WORK_EXCHANGE,
-            WORK_ROUTING_KEY_STATPUB_TO_BOK,
-            WORK_QUEUE_NAME_STATPUB_TO_BOK,
+            WORK_ROUTING_KEY_BOK_TO_DOCX,
+            WORK_QUEUE_NAME_BOK_TO_DOCX,
         )
         return True
 
@@ -472,7 +472,7 @@ async def _setup_amqp_once() -> bool:
         logger.warning(
             "[%s] AMQP connection failed (%s). Running without RabbitMQ. "
             "HTTP endpoints remain available.",
-            MODULE_NAME_STATPUB_TO_BOK, repr(e)
+            MODULE_NAME_BOK_TO_DOCX, repr(e)
         )
 
         # Ensure disabled/clean-ish state (best effort)
