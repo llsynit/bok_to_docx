@@ -410,7 +410,6 @@ async def _setup_amqp_once():
         app.state.amqp_conn = None
         app.state.amqp_ch = None
         return False
-'''
 
 async def _setup_amqp_once() -> bool:
     """
@@ -490,6 +489,66 @@ async def _setup_amqp_once() -> bool:
         except Exception:
             pass
 
+        app.state.amqp_conn = None
+        app.state.amqp_ch = None
+        app.state.work_ex = None
+        app.state.results_ex = None
+        app.state.work_q = None
+        app.state.work_consumer_tag = None
+        return False
+
+'''
+
+
+async def _setup_amqp_once() -> bool:
+    if getattr(app.state, "amqp_enabled", False) and getattr(app.state, "amqp_conn", None):
+        return True
+
+    conn = None
+    ch = None
+    try:
+        conn = await aio_pika.connect_robust(RABBITMQ_URL)
+        ch = await conn.channel()
+        await ch.set_qos(prefetch_count=1)
+
+        work_ex = await ch.declare_exchange(WORK_EXCHANGE, aio_pika.ExchangeType.DIRECT, durable=True)
+        results_ex = await ch.declare_exchange(RESULTS_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True)
+
+        q = await ch.declare_queue(WORK_QUEUE_NAME_BOK_TO_DOCX, durable=True)
+        await q.bind(work_ex, routing_key=WORK_ROUTING_KEY_BOK_TO_DOCX)
+
+        consumer_tag = await q.consume(_handle_work_message, no_ack=False)
+
+        app.state.amqp_conn = conn
+        app.state.amqp_ch = ch
+        app.state.work_ex = work_ex
+        app.state.results_ex = results_ex
+        app.state.work_q = q
+        app.state.work_consumer_tag = consumer_tag
+        app.state.amqp_enabled = True
+
+        logger.info("[%s] consuming: exchange='%s' rk='%s' queue='%s'",
+                    MODULE_NAME_BOK_TO_DOCX, WORK_EXCHANGE, WORK_ROUTING_KEY_BOK_TO_DOCX, WORK_QUEUE_NAME_BOK_TO_DOCX)
+        return True
+
+    except (AMQPConnectionError, OSError, ConnectionRefusedError) as e:
+        logger.warning("[%s] AMQP connection failed (%s). Running without RabbitMQ. HTTP endpoints remain available.",
+                       MODULE_NAME_BOK_TO_DOCX, repr(e))
+        app.state.amqp_enabled = False
+
+        # Lukk LOKALE ressurser (disse er de farlige lekkasjene)
+        try:
+            if ch is not None and not ch.is_closed:
+                await ch.close()
+        except Exception:
+            pass
+        try:
+            if conn is not None and not conn.is_closed:
+                await conn.close()
+        except Exception:
+            pass
+
+        # Rydd state
         app.state.amqp_conn = None
         app.state.amqp_ch = None
         app.state.work_ex = None
