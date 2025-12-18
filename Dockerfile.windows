@@ -1,0 +1,58 @@
+# escape=`
+FROM python:3.12-windowsservercore-ltsc2022
+
+# Bruk full sti til PowerShell for å unngå PATH-problemer
+SHELL ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+
+ENV PYTHONDONTWRITEBYTECODE=1 `
+    PYTHONUNBUFFERED=1 `
+    APP_HOME=C:\app `
+    BOK_TO_DOCX_PORT=39015 `
+    LOG_LEVEL=INFO `
+    PIP_NO_CACHE_DIR=1 `
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR C:\app
+
+# --- Pandoc (installeres som ZIP fra GitHub releases) ---
+ARG PANDOC_VERSION=3.1.13
+ENV PANDOC_VERSION=${PANDOC_VERSION}
+
+RUN $ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; `
+    $v=$env:PANDOC_VERSION; `
+    $u=('https://github.com/jgm/pandoc/releases/download/' + $v + '/pandoc-' + $v + '-windows-x86_64.zip'); `
+    Write-Host ('Pandoc version: ' + $v); `
+    Write-Host ('Downloading: ' + $u); `
+    Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile C:\pandoc.zip; `
+    New-Item -ItemType Directory -Force C:\pandoc | Out-Null; `
+    Expand-Archive -Path C:\pandoc.zip -DestinationPath C:\pandoc -Force; `
+    Remove-Item C:\pandoc.zip
+
+# Ikke tukle med PATH; bruk heller eksplisitt sti til pandoc
+ENV PANDOC_HOME=C:\pandoc\pandoc-${PANDOC_VERSION}
+ENV PANDOC_BIN=C:\pandoc\pandoc-${PANDOC_VERSION}\pandoc.exe
+
+# --- Python deps ---
+COPY requirements.txt .
+
+# Bruk eksplisitt python-sti for stabilitet (unngår PATH-issues)
+# Finn python i imagen
+RUN $ErrorActionPreference='Stop'; & 'C:\Python\python.exe' --version
+RUN $ErrorActionPreference='Stop'; & 'C:\Python\python.exe' -m pip --version
+RUN $ErrorActionPreference='Stop'; & 'C:\Python\python.exe' -m pip install --upgrade pip
+RUN $ErrorActionPreference='Stop'; & 'C:\Python\python.exe' -m pip install --no-cache-dir -r requirements.txt
+
+# --- App code ---
+COPY app.py bok2docx.py config.py utils.py ./
+
+# Appen din forventer ofte en artifacts-mappe
+RUN New-Item -ItemType Directory -Force C:\app\artifacts | Out-Null
+
+EXPOSE 39015
+
+# Enkel TCP healthcheck
+HEALTHCHECK --interval=20s --timeout=3s --retries=5 `
+  CMD powershell -NoProfile -Command "$c=New-Object Net.Sockets.TcpClient; $c.Connect('127.0.0.1',[int]$env:BOK_TO_DOCX_PORT); $c.Close();"
+
+# Start API
+CMD ["C:\\Python\\python.exe","-m","uvicorn","app:app","--host","0.0.0.0","--port","39015"]
