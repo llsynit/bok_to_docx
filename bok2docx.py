@@ -66,7 +66,7 @@ PANDOC_BIN = os.getenv("PANDOC_BIN", "pandoc")
 
 THIS_DIR = Path(__file__).resolve().parent
 STATIC_DIR = THIS_DIR / "static"
-OUTPUT_DIR = THIS_DIR / "output"
+OUTPUT_DIR = THIS_DIR / "artifacts"
 
 # Marker/”tokens” brukt både i prepare og clean:
 EMPTY = "blank_line"
@@ -175,7 +175,19 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
       - listejustering / innrykk med TOINN
       - "Excel-lignende" tabeller flyttes ut til CSV (hvis ikke --no-excel)
     """
-    grade = args.grade if args.grade is not None else DEFAULT_GRADE
+    #grade = args.grade if args.grade is not None else DEFAULT_GRADE
+
+    if args.grade and args.grade.isdigit():
+        args.grade = int(args.grade)
+    else:
+        for keyword in soup('meta', attrs={'name':'dc:subject.keyword'}):
+            if 'content' in keyword.attrs and keyword['content'].isdigit():
+                args.grade = int(keyword['content'])
+                break
+    if not args.grade:
+        args.grade = 10  # default høyeste nivå
+
+    logger.info(f'Assumed grade level: {args.grade}')
 
     # Moved to statpub_to_bok
     '''
@@ -250,13 +262,55 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
             p.string = "Bilde:" + (f" {alt}" if alt else "")
             img.insert_before(p)
             img.decompose()
-
+    
+    '''
     # Lister: legg inn logiske innrykk ved hjelp av TOINN
     args.logger.info("4.x Lister → innrykk med TOINN")
     for li in soup.find_all("li"):
         depth = sum(1 for p in li.parents if getattr(p, "name", None) in ("ul", "ol"))
         if depth > 0:
             li.insert(0, NavigableString(TOINN * (depth - 1)))
+    '''
+
+    def get_li_level(li):
+        depth = 0
+        for parent in li.parents:
+            if parent.name in ('ul', 'ol'):
+                depth += 1
+        return depth
+    
+    '''
+    # Convert nested lists to div + p with TOINN
+    # Unordered lists are to be prefixed with '-- '
+    # Ordered lists are to be prefixed with '1.', '2.', etc.
+    def convert_list_to_div(l):
+        new_div = soup.new_tag('div')
+        for child in l.find_all('li', recursive=False):
+            for sublist in child.find_all(['ul', 'ol'], recursive=False):
+                convert_list(sublist)
+            parts = []
+            for content in child.contents:
+                if getattr(content, 'name', None) in ('ul', 'ol'):
+                    continue
+                if hasattr(content, 'get_text'):
+                    txt = content.get_text(" ", strip=True)
+                else:
+                    txt = str(content).strip()
+                if txt:
+                    parts.append(txt)
+            text = " ".join(parts).strip()
+            if not text:
+                continue
+            p = soup.new_tag('p')
+            p.string = f"{TOINN * (get_li_level(child) - 1)}{text}"
+            new_div.append(p)
+        l.insert_before(new_div)
+        l.decompose()
+        
+    for list_tag in reversed(soup.find_all(['ul', 'ol'])):
+        convert_list_to_div(list_tag)
+    '''
+
 
     # Moved to statpub_to_bok
     '''
@@ -693,10 +747,20 @@ def convert(args):
         args.logger.error("Klarte ikke lese input: %s", e)
         return 2
 
+    def find_production_number(soup: BeautifulSoup) -> str:
+        """Finn produksjonsnummer fra metadata eller filnavn."""
+        # Prøv metadata først
+        meta = soup.find("meta", attrs={"name": "production_number"})
+        if meta and meta.has_attr("content"):
+            return meta["content"].strip()
+        # Fallback: bruk filstamme
+        return actual_xhtml.stem
+
     with tempfile.TemporaryDirectory(prefix="bok_to_docx_") as tmp_s:
         tmp = Path(tmp_s)
 
         # prepare
+        production_number = find_production_number(soup)
         prepared = prepare_soup(soup, args)
         prepared_html = tmp / (actual_xhtml.name if actual_xhtml.suffix else "prepared.xhtml")
         prepared_html.write_text(str(prepared), encoding="utf-8")
@@ -721,12 +785,14 @@ def convert(args):
             args.logger.error("DOCX-etterbehandling feilet: %s", e)
             return 1
 
+        '''
         # Bestem endelig output
         if args.stdout:
             bio = io.BytesIO()
             doc.save(bio)
             sys.stdout.buffer.write(bio.getvalue())
             return 0
+        '''
 
         '''
         if args.output:
@@ -737,7 +803,7 @@ def convert(args):
         '''
 
         # Default: lag mappen output/<production_number>/, og lag filnavn ut fra tittel
-        production_number = actual_xhtml.stem
+        #production_number = actual_xhtml.stem
         '''
         out_dir = OUTPUT_DIR / production_number
         if out_dir.exists():
@@ -746,18 +812,23 @@ def convert(args):
         out_dir.mkdir(parents=True, exist_ok=True)
         '''
 
+        '''
         if args.job_dir.exists():
             args.logger.info("Fjerner gammel output-mappe: %s", args.job_dir)
             shutil.rmtree(args.job_dir)
         args.job_dir.mkdir(parents=True, exist_ok=True)
+        '''
 
         title = _derive_title(doc)
         #final_name = f"{title} {actual_xhtml.with_suffix('.docx').name}"
         #final_path = out_dir / final_name
-        final_name = f"{production_number}.docx"
+        final_name = f"{args.production_number}.docx"
         final_path = args.job_dir / final_name
+        print(f'Final path will be: {final_path}')
         doc.save(str(final_path))
         args.logger.info("Skrev %s", final_path)
+        args.logger.info(f'Final path: {final_path}')
+        args.logger.info("Tittel hentet fra dokumentet: %s", title)
         return 0
 
     args.logger.error("Ukjent kommando.")
@@ -838,8 +909,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         help="Antall TOC-nivåer (hint til prepare).",
     )
-
-    # Hoved-IO-argumenter (uten "convert")
     p.add_argument(
         "input",
         help="XHTML/HTML-fil, mappe (utpakket EPUB), eller '-' for stdin.",
@@ -849,6 +918,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Output .docx",
     )
+    p.add_argument(
+        "--job_dir",
+        type=Path,
+        default=OUTPUT_DIR,
+        help="Output-mappe for genererte DOCX-filer (standard: artifacts).",
+    )
+    p.add_argument(
+            '--production_number',
+            type=str,
+            default='production_number',
+            help='Produksjonsnummer for output DOCX-filen (standard: production_number)',
+        )
 
     return p
 
