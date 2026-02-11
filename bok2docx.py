@@ -87,6 +87,8 @@ LANGUAGES_TRAILING = ["Bokmål", "Nynorsk", "BokmÃ¥l"]  # OBS: inkluder mulig 
 MAX_TABLE_WIDTH_CHARS = 54  # ca. bredde for å vurdere om tabell bør ut
 EXCEL_DIRNAME = "Excel"
 
+DEFAULT_PRODUCTION_NUMBER = "000"
+
 # ------------------------------------------------------------------------------
 def configure_logging(level: str = DEFAULT_LOG_LEVEL) -> None:
     logging.basicConfig(
@@ -98,6 +100,11 @@ def configure_logging(level: str = DEFAULT_LOG_LEVEL) -> None:
 
 logger = logging.getLogger("bok_to_docx")
 
+def find_production_number(soup: BeautifulSoup) -> str:
+    if (meta := soup.find("meta", attrs={"name": "dc:identifier"})) and meta.has_attr("content"):
+        return meta["content"].strip()
+    else:
+        return DEFAULT_PRODUCTION_NUMBER
 
 # ==============================================================================
 # 1) PREPARE (tidligere prepareXdocx.py — forkortet/robustifisert)
@@ -177,7 +184,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
     """
     #grade = args.grade if args.grade is not None else DEFAULT_GRADE
 
-    if args.grade and args.grade.isdigit():
+    if args.grade and isinstance(args.grade, int):
         args.grade = int(args.grade)
     else:
         for keyword in soup('meta', attrs={'name':'dc:subject.keyword'}):
@@ -188,6 +195,13 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
         args.grade = 10  # default høyeste nivå
 
     logger.info(f'Assumed grade level: {args.grade}')
+
+
+
+    if args.production_number == DEFAULT_PRODUCTION_NUMBER:
+        args.production_number = find_production_number(soup)
+        args.logger.warning("Produksjonsnummer ikke funnet i metadata, bruker fallback: %s", args.production_number)
+
 
     # Moved to statpub_to_bok
     '''
@@ -263,55 +277,6 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
             img.insert_before(p)
             img.decompose()
     
-    '''
-    # Lister: legg inn logiske innrykk ved hjelp av TOINN
-    args.logger.info("4.x Lister → innrykk med TOINN")
-    for li in soup.find_all("li"):
-        depth = sum(1 for p in li.parents if getattr(p, "name", None) in ("ul", "ol"))
-        if depth > 0:
-            li.insert(0, NavigableString(TOINN * (depth - 1)))
-    '''
-
-    def get_li_level(li):
-        depth = 0
-        for parent in li.parents:
-            if parent.name in ('ul', 'ol'):
-                depth += 1
-        return depth
-    
-    '''
-    # Convert nested lists to div + p with TOINN
-    # Unordered lists are to be prefixed with '-- '
-    # Ordered lists are to be prefixed with '1.', '2.', etc.
-    def convert_list_to_div(l):
-        new_div = soup.new_tag('div')
-        for child in l.find_all('li', recursive=False):
-            for sublist in child.find_all(['ul', 'ol'], recursive=False):
-                convert_list(sublist)
-            parts = []
-            for content in child.contents:
-                if getattr(content, 'name', None) in ('ul', 'ol'):
-                    continue
-                if hasattr(content, 'get_text'):
-                    txt = content.get_text(" ", strip=True)
-                else:
-                    txt = str(content).strip()
-                if txt:
-                    parts.append(txt)
-            text = " ".join(parts).strip()
-            if not text:
-                continue
-            p = soup.new_tag('p')
-            p.string = f"{TOINN * (get_li_level(child) - 1)}{text}"
-            new_div.append(p)
-        l.insert_before(new_div)
-        l.decompose()
-        
-    for list_tag in reversed(soup.find_all(['ul', 'ol'])):
-        convert_list_to_div(list_tag)
-    '''
-
-
     # Moved to statpub_to_bok
     '''
     # Oppgavetegn “>>>” → blank linje foran og etter
@@ -361,83 +326,119 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
     for blank_line in soup(attrs={'class':EMPTY}):
         blank_line.string = EMPTY
 
-
-
     # Issues for grade < 8
     # <ul>
-
     if args.grade and args.grade < 8:
 
-        # UORDNEDE LISTER → div + p med "-- "
-        for ul in reversed(soup('ul')):
-            new_div = soup.new_tag('div')
-
-            for li in ul.find_all('li', recursive=False):
-                # dybde: tell både ul og ol som liste-nivå
-                depth = sum(1 for parent in li.parents if parent.name in ('ul', 'ol')) - 1
-                indent = '  ' * max(depth, 0)
-                parts = []
-
-                for child in li.contents:
-                    if getattr(child, 'name', None) in ('ul', 'ol'):
-                        continue
-                    if hasattr(child, 'get_text'):
-                        txt = child.get_text(" ", strip=True)
-                    else:
-                        txt = str(child).strip()
-                    if txt:
-                        parts.append(txt)
-
-                text = " ".join(parts).strip()
-                if not text:
+        def _li_own_text(li):
+            """Tekst i <li> uten å ta med nested <ul>/<ol>."""
+            parts = []
+            for child in li.contents:
+                if getattr(child, "name", None) in ("ul", "ol"):
                     continue
-
-                p = soup.new_tag('p')
-                p.string = f"{indent}-- {text}"
-                new_div.append(p)
-
-            ul.insert_before(new_div)
-            ul.decompose()
-
-        # ORDNEDE LISTER → div + p med '1.' / 'a.' osv.
-        for ol in reversed(soup('ol')):
-            new_div = soup.new_tag('div')
-            type_attr = (ol.get('type') or '').lower()  # f.eks. "a" eller ""
-
-            for idx, li in enumerate(ol.find_all('li', recursive=False), start=1):
-                depth = sum(1 for parent in li.parents if parent.name in ('ul', 'ol')) - 1
-                indent = '  ' * max(depth, 0)
-                parts = []
-
-                for child in li.contents:
-                    if getattr(child, 'name', None) in ('ul', 'ol'):
-                        continue
-                    if hasattr(child, 'get_text'):
-                        txt = child.get_text(' ', strip=True)
-                    else:
-                        txt = str(child).strip()
-                    if txt:
-                        parts.append(txt)
-
-                text = " ".join(parts).strip()
-                if not text:
-                    continue
-
-                # velg prefiks: bokstav. eller tall.
-                if type_attr == 'a':
-                    # a., b., c. ...
-                    marker = f"{chr(ord('a') + idx - 1)}."
+                if hasattr(child, "get_text"):
+                    txt = child.get_text(" ", strip=True)
                 else:
-                    # 1., 2., 3. ...
-                    marker = f"{idx}."
+                    txt = str(child).strip()
+                if txt:
+                    parts.append(txt)
+            return " ".join(parts).strip()
 
-                p = soup.new_tag('p')
-                p.string = f"{indent}{marker} {text}"
-                new_div.append(p)
+        def _render_list(list_tag, depth=0):
+            """
+            Returnerer en <div> med <p>-linjer for hele lista (rekursivt).
 
-            ol.insert_before(new_div)
-            ol.decompose()
+            - Uordnet: '-- ' + innrykk
+            - Ordnet: '1.' eller 'a.' + innrykk (hvis type="a")
+            - Hvis et <li> ikke har egen tekst, men bare en underliste,
+              så "promoteres" underlista til samme nivå (depth uendret).
+            """
+            new_div = soup.new_tag("div")
 
+            is_ordered = (list_tag.name == "ol")
+            type_attr = (list_tag.get("type") or "").lower() if is_ordered else ""
+
+            idx_counter = 0  # teller bare punkter som faktisk får egen linje
+
+            for li in list_tag.find_all("li", recursive=False):
+                own_text = _li_own_text(li)
+                nested_lists = [c for c in li.contents if getattr(c, "name", None) in ("ul", "ol")]
+
+                # Tom wrapper-<li> med bare underliste(r): promoter underlista på samme nivå
+                if not own_text and nested_lists:
+                    for nl in nested_lists:
+                        child_div = _render_list(nl, depth=depth + 1)
+                        for p in child_div.find_all("p", recursive=False):
+                            new_div.append(p)
+                    continue
+
+                # Skriv linje for dette <li>-punktet (hvis det har tekst)
+                if own_text:
+                    indent = TOINN * max(depth, 0)
+
+                    if is_ordered:
+                        idx_counter += 1
+                        if type_attr == "a":
+                            marker = f"{chr(ord('a') + idx_counter - 1)}."
+                        else:
+                            marker = f"{idx_counter}."
+                        prefix = f"{indent}{marker} "
+                    else:
+                        prefix = f"{indent}-- "
+
+                    p = soup.new_tag("p")
+                    p.string = f"{prefix}{own_text}"
+                    new_div.append(p)
+
+                # Render underlister rekursivt
+                # Underlister blir ett nivå dypere når parent-li faktisk hadde tekstlinje
+                child_depth = depth + (1 if own_text else 0)
+
+                for nl in nested_lists:
+                    child_div = _render_list(nl, depth=child_depth)
+                    for p in child_div.find_all("p", recursive=False):
+                        new_div.append(p)
+
+            return new_div
+
+        def _is_detached(tag):
+            """True hvis tag ikke lenger er en del av DOM-treet."""
+            # Detached: ingen parent og ingen ancestor.
+            return tag.parent is None and tag.find_parent() is None
+
+        # Konverter bare "ytterste" lister; rekursjonen tar resten.
+        # Bruk while-loop for å unngå stale references når vi muterer DOM.
+        while True:
+            top = None
+            for cand in soup.find_all(["ul", "ol"]):
+                if cand.find_parent(["ul", "ol"]):
+                    continue  # nested, håndteres av rekursjonen
+                if _is_detached(cand):
+                    continue  # stale/detached, ignorer
+                top = cand
+                break
+
+            if not top:
+                break
+
+            new_div = _render_list(top, depth=0)
+
+            # Sett inn på en måte som tåler alle tilfeller
+            if top.parent:
+                top.insert_before(new_div)
+                top.decompose()
+            else:
+                # Top-level uten parent (fragment). Erstatt ved å trekke ut og legge inn div.
+                # (replace_with kan feile hvis elementet er i ferd med å være frakoblet)
+                try:
+                    top.extract()
+                except Exception:
+                    pass
+                soup.append(new_div)
+                try:
+                    top.decompose()
+                except Exception:
+                    pass
 
         # <em> and <strong> in excercises
         for span in soup.select('.exercisenumber'):
@@ -927,7 +928,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
             '--production_number',
             type=str,
-            default='production_number',
+            default=DEFAULT_PRODUCTION_NUMBER,
             help='Produksjonsnummer for output DOCX-filen (standard: production_number)',
         )
 
@@ -936,7 +937,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     args.logger = make_logger()
+
     result = convert(args)
+    
+
+    print('Testing production number output:')
+    print(args.production_number)
 
     match result:
         case 0:
