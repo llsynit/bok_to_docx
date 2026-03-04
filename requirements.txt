@@ -1,4 +1,7 @@
+aio-pika==9.5.7
 annotated-types==0.7.0
+httpx==0.28.1
+python-dotenv==1.2.1
 anyio==4.9.0
 beautifulsoup4==4.13.4
 bs4==0.0.2
