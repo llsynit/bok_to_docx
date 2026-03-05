@@ -4,3 +4,5 @@
 
 # Cache directories
 __pycache__/
+# local artifacts
+artifacts/
