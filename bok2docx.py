@@ -60,6 +60,9 @@ from docx.shared import Pt
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
+# --- lokale imports ---------------------------------------------------------------
+from statpub2bok import apply_requirements
+
 # --- Konstanter / miljø -------------------------------------------------------
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PANDOC_BIN = os.getenv("PANDOC_BIN", "pandoc")
@@ -114,7 +117,7 @@ def is_book(soup) -> bool:
     return soup.find("meta", attrs={"name": "dc:conformsTo", "content": "Statped_electronic_book_standard"}) is not None
 
 def run_statpub_to_bok_conversions(soup, args, logger):
-    pass
+    return apply_requirements(soup, args, logger)
 
 def get_table_width_chars(table) -> int:
     """Estimér ca. tegnbredde for tabellen basert på antall kolonner."""
@@ -192,7 +195,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
 
     if args.book or not is_book(soup):
         logger.info(f'Applying conversions from statpub_to_bok for {args.book}')
-        run_statpub_to_bok_conversions(soup, args, logger)
+        soup = run_statpub_to_bok_conversions(soup, args, logger)
 
     if args.grade and isinstance(args.grade, int):
         args.grade = int(args.grade)
@@ -944,6 +947,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument('-b',
                         '--book',
                         help = 'The statpub_to_bok converter methods are to be used',
+                        action = 'store_true')
+    p.add_argument(
+                        '-v', '--verbose',
+                        action='count',
+                        default=0,
+                        help='Increase verbosity: -v=INFO, -vv=DEBUG'
+                        )
+    p.add_argument('-p',
+                        '--p-length',
+                        help = 'The maximum length of a small paragraph',
+                        type = int)
+    p.add_argument('-l',
+                        '--link_footnotes',
+                        help = 'Link to footnotes in the text',
+                        action = 'store_true')
+    p.add_argument('-i',
+                        '--index',
+                        help = 'Remove indexes',
                         action = 'store_true')
 
     return p
