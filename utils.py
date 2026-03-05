@@ -99,7 +99,7 @@ def summarize_artifacts(ARTIFACTS_ROOT: Path) -> Dict[str, Any]:
         })
 
     # sort newest first
-    items.sort(key=lambda x: x["date_time_raw"], reverse=True)
+    items.sort(key=lambda x: x["date_time_raw"] or "", reverse=True)
     return {
         "root": str(root.resolve()),
         "total_artifacts": total_artifacts,
