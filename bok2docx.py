@@ -110,6 +110,12 @@ def find_production_number(soup: BeautifulSoup) -> str:
 # 1) PREPARE (tidligere prepareXdocx.py — forkortet/robustifisert)
 # ==============================================================================
 
+def is_book(soup) -> bool:
+    return soup.find("meta", attrs={"name": "dc:conformsTo", "content": "Statped_electronic_book_standard"}) is not None
+
+def run_statpub_to_bok_conversions(soup, args, logger):
+    pass
+
 def get_table_width_chars(table) -> int:
     """Estimér ca. tegnbredde for tabellen basert på antall kolonner."""
     max_cols = 0
@@ -183,6 +189,10 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
       - "Excel-lignende" tabeller flyttes ut til CSV (hvis ikke --no-excel)
     """
     #grade = args.grade if args.grade is not None else DEFAULT_GRADE
+
+    if args.book or not is_book(soup):
+        logger.info(f'Applying conversions from statpub_to_bok for {args.book}')
+        run_statpub_to_bok_conversions(soup, args, logger)
 
     if args.grade and isinstance(args.grade, int):
         args.grade = int(args.grade)
@@ -931,6 +941,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             default=DEFAULT_PRODUCTION_NUMBER,
             help='Produksjonsnummer for output DOCX-filen (standard: production_number)',
         )
+    p.add_argument('-b',
+                        '--book',
+                        help = 'The statpub_to_bok converter methods are to be used',
+                        action = 'store_true')
 
     return p
 
