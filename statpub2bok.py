@@ -659,7 +659,7 @@ def apply_requirements(soup, args, logger):
     #GRADE       = args.grade        if args.grade       else 8
     BODY        = soup.body         if soup.find('body')    else soup.new_tag('body') # TODO: make more robust
 
-    if args.grade and args.grade.isdigit():
+    if args.grade:
         args.grade = int(args.grade)
     else:
         for keyword in soup('meta', attrs={'name':'dc:subject.keyword'}):
@@ -1081,7 +1081,7 @@ def apply_requirements(soup, args, logger):
                 e_parent = parent
                 continue
         if e_parent is None:
-            emphasis.string = f'_{emphasis.get_text()}_'
+            emphasis.string = f'_{emphasis.get_text(strip=True)}_'
             emphasis.unwrap()
 
     # 4.17 Strukturinformasjon
@@ -1558,6 +1558,12 @@ def apply_requirements(soup, args, logger):
     # TODO: structure information, tasks, lists
 
     # ========================
+
+    # Add information on conversion. This is used by bok_to_docx
+    if (head := soup.head):
+        meta = soup.new_tag('meta', charset='utf-8')
+        meta['name'] = 'dc:conformsTo'
+        meta['content'] = 'Statped_electronic_book_standard'
 
 
     return soup
