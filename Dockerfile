@@ -28,10 +28,11 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 
 # --- App-kode ---
 # Kopierer hele repoet (app.py, bok_to_docx.py, statiske filer, osv.)
-COPY . .
+COPY app.py artifacts bok2docx.py config.py utils.py .
 
 # Sikre at kataloger finnes (brukes av app/konverterer)
 RUN mkdir -p ${APP_HOME}/static ${APP_HOME}/output
+COPY static/ ${APP_HOME}/static/
 
 # --- Non-root ---
 # UID 10001 som i andre moduler; gi skrivetilgang til appen
