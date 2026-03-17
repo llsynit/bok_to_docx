@@ -28,7 +28,7 @@ Eksempler:
 
 Som bibliotek:
   from bok_to_docx import xhtml_to_docx
-  bytes_out = xhtml_to_docx(xhtml_bytes, "out.docx", reference_docx=Path("static/referenceDoc.docx"))
+  bytes_out = xhtml_to_docx(xhtml_bytes, "out.docx", reference_docx=Path("static/TEMPLATE_SENIOR.docx"))
 
 Avhenger av:
   - pandoc (må finnes i PATH, eller sett PANDOC_BIN)
@@ -66,6 +66,8 @@ from statpub2bok import apply_requirements
 # --- Konstanter / miljø -------------------------------------------------------
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PANDOC_BIN = os.getenv("PANDOC_BIN", "pandoc")
+TEMPLATE_JUNIOR = "TEMPLATE_JUNIOR.docx"
+TEMPLATE_SENIOR = "TEMPLATE_SENIOR.docx"
 
 THIS_DIR = Path(__file__).resolve().parent
 STATIC_DIR = THIS_DIR / "static"
@@ -108,6 +110,14 @@ def find_production_number(soup: BeautifulSoup) -> str:
         return meta["content"].strip()
     else:
         return DEFAULT_PRODUCTION_NUMBER
+
+def get_ref_doc(args):
+    if args.reference_docx is not None:
+        return args.reference_docx
+    elif args.grade is not None and args.grade < 8:
+        return os.path.join(STATIC_DIR, TEMPLATE_JUNIOR)
+    else:
+        return os.path.join(STATIC_DIR, TEMPLATE_SENIOR)
 
 # ==============================================================================
 # 1) PREPARE (tidligere prepareXdocx.py — forkortet/robustifisert)
@@ -487,11 +497,14 @@ class PandocOptions:
 def run_pandoc(args, input_path: Path, output_path: Path, opts: PandocOptions) -> None:
     """
     Kjører pandoc for å lage DOCX av XHTML/HTML.
-    Søker default etter static/referenceDoc.docx hvis ikke eksplisitt oppgitt.
+    Søker default etter static/TEMPLATE_SENIOR.docx hvis ikke eksplisitt oppgitt.
     """
-    ref_doc = opts.reference_docx
+    ref_doc = get_ref_doc(args)
     if ref_doc is None:
-        candidate = STATIC_DIR / "referenceDoc.docx"
+        if args.grade and args.grade <= 7:
+            candidate = STATIC_DIR / TEMPLATE_JUNIOR
+        else:
+            candidate = STATIC_DIR / TEMPLATE_SENIOR
         if candidate.exists():
             ref_doc = candidate
 
@@ -501,10 +514,13 @@ def run_pandoc(args, input_path: Path, output_path: Path, opts: PandocOptions) -
         "-f", "html",
         "-t", "docx",
         "-o", str(output_path),
+        "--reference-doc", str(ref_doc),
         "--standalone",
     ]
+    '''
     if ref_doc and ref_doc.exists():
         cmd.extend(["--reference-doc", str(ref_doc)])
+    '''
 
     # bruker-flagg til slutt (f.eks --strip-comments, --toc)
     if opts.extra_flags:
@@ -713,7 +729,7 @@ def xhtml_to_docx(
 
 # New convert method
 def convert(args):
-    pandoc_opts = PandocOptions(reference_docx=args.reference_docx, extra_flags=args.pandoc_args or ())
+    pandoc_opts = PandocOptions(reference_docx=get_ref_doc(args), extra_flags=args.pandoc_args or ())
     clean_args = CleanArgs(grade=args.grade)
 
     # --- INPUT: fil, mappe, eller stdin
@@ -883,7 +899,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--reference-docx",
         type=Path,
         default=None,
-        help="Referanse-DOCX (overstyrer static/referenceDoc.docx).",
+        help="Referanse-DOCX (overstyrer static/TEMPLATE_SENIOR.docx).",
     )
     p.add_argument(
         "--pandoc-args",
