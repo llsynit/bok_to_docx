@@ -1072,6 +1072,17 @@ def apply_requirements(soup, args, logger):
 
     # 4.16 Utheving
     # -------------
+    for emphasis in list(BODY.find_all(['em', 'strong'])):
+        # Hopp over elementer som ligger inni annen utheving
+        if emphasis.find_parent(['em', 'strong']) is not None:
+            continue
+
+        text = emphasis.get_text()
+        emphasis.replace_with(NavigableString(f'_{text}_'))
+
+    '''
+    # 4.16 Utheving
+    # -------------
     # -> prepare_for_docx ?
     for emphasis in BODY(['em', 'strong']):
         e_parent = None
@@ -1083,6 +1094,7 @@ def apply_requirements(soup, args, logger):
         if e_parent is None:
             emphasis.string = f'_{emphasis.get_text(strip=True)}_'
             emphasis.unwrap()
+    '''
 
     # 4.17 Strukturinformasjon
     # ------------------------
@@ -1489,6 +1501,7 @@ def apply_requirements(soup, args, logger):
     # 14.4 De skal være på formen: Bokas tittel (antall sider) – Målform – Forfatter(e). #201
     # Ref. 08: Bokas tittel settes med tittelstil på første linje. På neste linje angis startside
     # og sluttside for det stoffet fra originalboka som er med i den tilrettelagte filen
+    '''
     logger.info('14.4 De skal være på formen: Bokas tittel (antall sider) – Målform – Forfatter(e) #201')
     if (titlepage := BODY.find('section', attrs={'epub:type': 'frontmatter titlepage'})):
         titlepage.clear()
@@ -1498,7 +1511,37 @@ def apply_requirements(soup, args, logger):
         p = soup.new_tag('p')
         p.string = f'side {metadata["pagenumbers"][0]} til {metadata["pagenumbers"][-1]}'
         titlepage.append(p)
+    '''
+    logger.info('14.4 De skal være på formen: Bokas tittel (antall sider) – Målform – Forfatter(e) #201')
 
+    if (titlepage := BODY.find('section', attrs={'epub:type': 'frontmatter titlepage'})):
+        titlepage.clear()
+
+        h1 = soup.new_tag('h1', attrs={'epub:type': 'fulltitle'})
+
+        title = (metadata.get('title') or '').strip()
+
+        pagenumbers = metadata.get('pagenumbers') or []
+        page_count_text = f'({len(pagenumbers)} sider)' if pagenumbers else ''
+
+        lang = (metadata.get('language') or '').strip().lower()
+        maalform = {'nb': 'Bokmål', 'nn': 'Nynorsk'}.get(lang, '')
+
+        authors = metadata.get('authors') or []
+        if len(authors) == 1:
+            author_text = (authors[0] or '').strip()
+        elif len(authors) > 1:
+            first = (authors[0] or '').strip()
+            surname = first.split()[-1] if first else ''
+            author_text = f'{surname} mfl.' if surname else 'mfl.'
+        else:
+            author_text = ''
+
+        first_part = ' '.join(part for part in [title, page_count_text] if part)
+        line = ' – '.join(part for part in [first_part, maalform, author_text] if part)
+
+        h1.string = line
+        titlepage.append(h1)
 
     # 4.5 Innholdsfortegnelse
     # To be removed in prepare_for_docx and added with pandoc
