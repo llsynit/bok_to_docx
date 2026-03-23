@@ -1006,5 +1006,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.logger.error("Ukjent avslutningskode: %s", result)
 
 
+
 if __name__ == "__main__":
     raise SystemExit(main())
