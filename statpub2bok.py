@@ -845,6 +845,15 @@ def apply_requirements(soup, args, logger):
             section.decompose()
     # TODO: Source list
     # TODO: Image list
+    image_creds = [
+            'Bildekreditering',
+            'Bildekrediteringar',
+            'Bilder og illustrasjoner'
+            ] 
+    for section in soup('section', attrs={'epub:type':'backmatter'}):
+        if (h := section.find(re.compile('^h[1-6]$'))) and h.get_text().strip() in image_creds:
+            logger.info(f'Removing image credits section {section["id"]}')
+            section.decompose()
 
     # 4.8 Stoff fra bokomslaget
     # --------------------------
@@ -1021,7 +1030,7 @@ def apply_requirements(soup, args, logger):
     # -------------
     # -> prepare_for_docx
     logger.info('4.12 Sidetall')
-    for pagebreak in metadata['pages']:
+    for pagebreak in soup(attrs={'epub:type':'pagebreak'}): #metadata['pages']:
         page_element = pagebreak
         for parent in pagebreak.parents:
             if parent.name == 'p':
