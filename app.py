@@ -138,8 +138,15 @@ async def process(file: UploadFile, config: UploadFile, file2: Optional[UploadFi
             "message": module_version,
             "timestamp": None
         })
+        manifest = {
+            "primary": filename,
+            "secondary": None,
+            "log": "log.json",
+            "report":  None
+        }
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(manifest))
             if result_bytes:
                 zf.writestr(filename, result_bytes)
             if log_records:
