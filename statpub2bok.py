@@ -1089,22 +1089,6 @@ def apply_requirements(soup, args, logger):
         text = emphasis.get_text()
         emphasis.replace_with(NavigableString(f'_{text}_'))
 
-    '''
-    # 4.16 Utheving
-    # -------------
-    # -> prepare_for_docx ?
-    for emphasis in BODY(['em', 'strong']):
-        e_parent = None
-        for parent in emphasis.parents:
-            if parent.name in ['em', 'strong']:
-                elemennt.unwrap()
-                e_parent = parent
-                continue
-        if e_parent is None:
-            emphasis.string = f'_{emphasis.get_text(strip=True)}_'
-            emphasis.unwrap()
-    '''
-
     # 4.17 Strukturinformasjon
     # ------------------------
     # Asides
@@ -1383,6 +1367,7 @@ def apply_requirements(soup, args, logger):
 
     # TODO: Chapter 8
 
+
     # 9 Unngå sammenslåtte og delte celler og tomme rader og kolonner. #186
     # ---------------------------------------------------------------------
     logger.info('9 Unngå sammenslåtte og delte celler og tomme rader og kolonner')
@@ -1579,9 +1564,12 @@ def apply_requirements(soup, args, logger):
             if parent.name == 'section':
                 if 'epub:type' in parent.attrs and 'backmatter' not in parent['epub:type']:
                     p = soup.new_tag('p')
-                    a = soup.new_tag('a', href=f'#{heading["id"]}')
-                    a.string = heading.get_text()
-                    p.append(a)
+                    if args.grade > 7: 
+                        a = soup.new_tag('a', href=f'#{heading["id"]}')
+                        a.string = heading.get_text()
+                        p.append(a)
+                    else:
+                        p.string = heading.get_text()
                     toc.append(p)
 
     first_lines.insert_after(toc)
