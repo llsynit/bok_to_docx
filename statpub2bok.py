@@ -1169,7 +1169,14 @@ def apply_requirements(soup, args, logger):
 
     # 5.3 Ordlister
     # -------------
-    # -> prepare_for_docx TODO: check if relevant for other formats
+    # TODO: check if relevant for other formats
+    # TODO: format glossaries
+    if args.grade < 8:
+        for section in soup('section'):
+            if not section.find('section'): # Lowest section level
+                for aside in section(attrs={'class':'glossary'}):
+                    print('ORDFORKLARINGER')
+                    print(aside)
 
     # 6 Oppgaver
     # ==========
@@ -1366,7 +1373,40 @@ def apply_requirements(soup, args, logger):
             element.replace_with(new_text_str)
 
     # TODO: Chapter 8
+    # For now, this is implemented by sorting caption and alt-text. 
 
+    for figure in soup('figure'):
+        main_figure = figure
+        for parent in figure.parents:
+            if parent.name == 'figure':
+                main_figure = parent
+
+        # Caption
+        if (caption := figure.find('figcaption')):
+            caption_texts = [p.get_text() for p in caption.find_all('p')] if caption.find('p') else [caption.get_text()]
+            text_count = 0
+            for text in caption_texts:
+                p = soup.new_tag('p')
+                p.string = f'Bilde: {text}' if text_count == 0 else text
+                main_figure.insert_before(p)
+
+        else:
+            p = soup.new_tag('p')
+            p.string = "Bilde:"
+            main_figure.insert_before(p)
+
+        # Alt-text
+        alt_text = None 
+        if (img := figure.find('img')) and 'alt' in img.attrs:
+            alt_text = img['alt']
+            if alt_text not in ['Figur']:
+                p = soup.new_tag('p')
+                p.string = alt_text
+                main_figure.insert_before(p)
+
+    print('REMOVING FIGURES')
+    for figure in soup('figure'):
+        figure.decompose()
 
     # 9 Unngå sammenslåtte og delte celler og tomme rader og kolonner. #186
     # ---------------------------------------------------------------------

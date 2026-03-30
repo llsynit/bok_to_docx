@@ -273,6 +273,8 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
             _prepend_blank_line(soup, h)
     '''
 
+    
+    '''
     # Bilder/figurer → “Bilde: <alt>”
     args.logger.info("8.x Bilder/figurer")
     for fig in soup.find_all("figure"):
@@ -299,7 +301,8 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
             p.string = "Bilde:" + (f" {alt}" if alt else "")
             img.insert_before(p)
             img.decompose()
-    
+    '''
+
     # Moved to statpub_to_bok
     '''
     # Oppgavetegn “>>>” → blank linje foran og etter
