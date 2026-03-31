@@ -1087,12 +1087,15 @@ def apply_requirements(soup, args, logger):
         if args.grade < 8 and emphasis.find(attrs={'class': 'exercisenumber'}) is not None:
             emphasis.unwrap()
             continue
-
+        if 'dl' in [parent.name for parent in emphasis.parents]:
+            emphasis.unwrap()
+            continue
         if emphasis.find_parent(['em', 'strong']) is not None:
             continue
 
         text = emphasis.get_text()
         emphasis.replace_with(NavigableString(f'_{text}_'))
+
 
     # 4.17 Strukturinformasjon
     # ------------------------
