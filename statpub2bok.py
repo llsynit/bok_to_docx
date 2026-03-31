@@ -1171,10 +1171,11 @@ def apply_requirements(soup, args, logger):
     # -------------
     # TODO: check if relevant for other formats
     # TODO: format glossaries
-    if args.grade < 8:
+    if args.grade < 6:
         for glossary in soup(attrs={'class': 'glossary'}):
             if (glossary_heading := glossary.find(re.compile('^h[1-6]$'))) and not glossary_heading.get_text().strip().endswith(':'):
                 glossary_heading.string = glossary_heading.get_text().strip() + ':'
+                glossary_heading.name = 'p'
             for parent in glossary.parents:
                 if parent.name == 'section':
                     if (heading := parent.find(re.compile('^h[1-6]$'))):
