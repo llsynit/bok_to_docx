@@ -1081,8 +1081,13 @@ def apply_requirements(soup, args, logger):
 
     # 4.16 Utheving
     # -------------
+    logger.info('4.16 Utheving')
     for emphasis in list(BODY.find_all(['em', 'strong'])):
         # Hopp over elementer som ligger inni annen utheving
+        if args.grade < 8 and emphasis.find(attrs={'class': 'exercisenumber'}) is not None:
+            emphasis.unwrap()
+            continue
+
         if emphasis.find_parent(['em', 'strong']) is not None:
             continue
 
