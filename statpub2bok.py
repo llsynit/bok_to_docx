@@ -845,6 +845,15 @@ def apply_requirements(soup, args, logger):
             section.decompose()
     # TODO: Source list
     # TODO: Image list
+    image_creds = [
+            'Bildekreditering',
+            'Bildekrediteringar',
+            'Bilder og illustrasjoner'
+            ] 
+    for section in soup('section', attrs={'epub:type':'backmatter'}):
+        if (h := section.find(re.compile('^h[1-6]$'))) and h.get_text().strip() in image_creds:
+            logger.info(f'Removing image credits section {section["id"]}')
+            section.decompose()
 
     # 4.8 Stoff fra bokomslaget
     # --------------------------
@@ -1021,7 +1030,7 @@ def apply_requirements(soup, args, logger):
     # -------------
     # -> prepare_for_docx
     logger.info('4.12 Sidetall')
-    for pagebreak in metadata['pages']:
+    for pagebreak in soup(attrs={'epub:type':'pagebreak'}): #metadata['pages']:
         page_element = pagebreak
         for parent in pagebreak.parents:
             if parent.name == 'p':
@@ -1072,17 +1081,21 @@ def apply_requirements(soup, args, logger):
 
     # 4.16 Utheving
     # -------------
-    # -> prepare_for_docx ?
-    for emphasis in BODY(['em', 'strong']):
-        e_parent = None
-        for parent in emphasis.parents:
-            if parent.name in ['em', 'strong']:
-                elemennt.unwrap()
-                e_parent = parent
-                continue
-        if e_parent is None:
-            emphasis.string = f'_{emphasis.get_text(strip=True)}_'
+    logger.info('4.16 Utheving')
+    for emphasis in list(BODY.find_all(['em', 'strong'])):
+        # Hopp over elementer som ligger inni annen utheving
+        if args.grade < 8 and emphasis.find(attrs={'class': 'exercisenumber'}) is not None:
             emphasis.unwrap()
+            continue
+        if 'dl' in [parent.name for parent in emphasis.parents]:
+            emphasis.unwrap()
+            continue
+        if emphasis.find_parent(['em', 'strong']) is not None:
+            continue
+
+        text = emphasis.get_text()
+        emphasis.replace_with(NavigableString(f'_{text}_'))
+
 
     # 4.17 Strukturinformasjon
     # ------------------------
@@ -1164,7 +1177,18 @@ def apply_requirements(soup, args, logger):
 
     # 5.3 Ordlister
     # -------------
-    # -> prepare_for_docx TODO: check if relevant for other formats
+    # TODO: check if relevant for other formats
+    # TODO: format glossaries
+    if args.grade < 6:
+        for glossary in soup(attrs={'class': 'glossary'}):
+            if (glossary_heading := glossary.find(re.compile('^h[1-6]$'))) and not glossary_heading.get_text().strip().endswith(':'):
+                glossary_heading.string = glossary_heading.get_text().strip() + ':'
+                glossary_heading.name = 'p'
+            for parent in glossary.parents:
+                if parent.name == 'section':
+                    if (heading := parent.find(re.compile('^h[1-6]$'))):
+                        heading.insert_after(glossary)
+                    break
 
     # 6 Oppgaver
     # ==========
@@ -1175,8 +1199,40 @@ def apply_requirements(soup, args, logger):
     # -------------------------------------------
     logger.info('6.1.1 Oppgavetegn og oppgavenummerering')
     for task_section in BODY('section', attrs={'class': 'task'}):
+        '''
         if (heading := task_section.find(re.compile('^h[1-6]$'))):
             heading.insert(0, NavigableString('>>> '))
+        '''
+
+        for exercise_number in task_section(attrs={'class': 'exercisenumber'}):
+            exercise_number.insert(0, NavigableString('>>> '))
+
+        for ol in section.find_all('ol'):
+            start = 1
+            if ol.has_attr('start'):
+                try:
+                    start = int(ol['start'])
+                except Exception:
+                    start = 1
+
+            items = ol.find_all('li', recursive=False)
+            for i, li in enumerate(items, start=start):
+                prefix = f'>>> {i}. '
+
+                # Unngå dobbel prefiks hvis metoden kjøres flere ganger
+                existing_text = li.get_text(' ', strip=True)
+                if existing_text.startswith(prefix.strip()):
+                    continue
+
+                # Sett inn prefiks først i <li>
+                if li.contents:
+                    first = li.contents[0]
+                    if isinstance(first, str):
+                        li.contents[0].replace_with(prefix + first)
+                    else:
+                        li.insert(0, prefix)
+                else:
+                    li.string = prefix
     
     # 6.3 Utfyllingsoppgaver #32
     # --------------------------
@@ -1361,6 +1417,40 @@ def apply_requirements(soup, args, logger):
             element.replace_with(new_text_str)
 
     # TODO: Chapter 8
+    # For now, this is implemented by sorting caption and alt-text. 
+
+    for figure in soup('figure'):
+        main_figure = figure
+        for parent in figure.parents:
+            if parent.name == 'figure':
+                main_figure = parent
+
+        # Caption
+        if (caption := figure.find('figcaption')):
+            caption_texts = [p.get_text() for p in caption.find_all('p')] if caption.find('p') else [caption.get_text()]
+            text_count = 0
+            for text in caption_texts:
+                p = soup.new_tag('p')
+                p.string = f'Bilde: {text}' if text_count == 0 else text
+                main_figure.insert_before(p)
+
+        else:
+            p = soup.new_tag('p')
+            p.string = "Bilde:"
+            main_figure.insert_before(p)
+
+        # Alt-text
+        alt_text = None 
+        if (img := figure.find('img')) and 'alt' in img.attrs:
+            alt_text = img['alt']
+            if alt_text not in ['Figur']:
+                p = soup.new_tag('p')
+                p.string = alt_text
+                main_figure.insert_before(p)
+
+    print('REMOVING FIGURES')
+    for figure in soup('figure'):
+        figure.decompose()
 
     # 9 Unngå sammenslåtte og delte celler og tomme rader og kolonner. #186
     # ---------------------------------------------------------------------
@@ -1393,6 +1483,314 @@ def apply_requirements(soup, args, logger):
     # 9.3 Tabell som liste #77
     # ------------------------
     # Manually
+    args.logger.info("9.3 - Vurderer tabeller som liste/lineær tekst for leselist")
+
+    def _cell_text(cell):
+        if cell is None:
+            return ""
+        text = " ".join(cell.stripped_strings)
+        return " ".join(text.split()).strip()
+
+    def _table_to_matrix(table):
+        """
+        Leser en enkel HTML-tabell til matrise.
+        Håndterer ikke rowspan/colspan perfekt, men fungerer for vanlige tabeller.
+        """
+        matrix = []
+        trs = table.find_all("tr")
+        for tr in trs:
+            cells = tr.find_all(["th", "td"])
+            row = [_cell_text(cell) for cell in cells]
+            # hopp over helt tomme rader
+            if any(cell for cell in row):
+                matrix.append(row)
+        return matrix
+
+    def _normalize_matrix(matrix):
+        if not matrix:
+            return []
+        width = max(len(row) for row in matrix)
+        return [row + [""] * (width - len(row)) for row in matrix]
+
+    def _transpose_matrix(matrix):
+        if not matrix:
+            return []
+        normalized = _normalize_matrix(matrix)
+        return [list(col) for col in zip(*normalized)]
+
+    def _is_probably_numeric(text):
+        if not text:
+            return False
+        t = text.strip()
+        # fjern vanlige enheter/symboler for enkel vurdering
+        for token in ["mSv", "%", "kg", "g", "cm", "mm", "kr", "€", "$"]:
+            t = t.replace(token, "")
+        t = t.strip().replace(" ", "")
+        # norsk desimalskilletegn
+        t = t.replace(",", ".")
+        try:
+            float(t)
+            return True
+        except Exception:
+            return False
+
+    def _looks_like_header_row(matrix):
+        """
+        Enkel heuristikk:
+        Første rad er ofte overskriftsrad hvis:
+        - den finnes
+        - og de fleste cellene i rad 2..n ikke er identiske med rad 1
+        - og første rad virker mer 'etikettaktig' enn radene under
+        """
+        if len(matrix) < 2:
+            return False
+
+        first_row = matrix[0]
+        second_row = matrix[1]
+
+        # Hvis første rad har flere tekstlige etiketter og neste rad mer dataaktige verdier
+        texty_first = sum(1 for c in first_row if c and not _is_probably_numeric(c))
+        texty_second = sum(1 for c in second_row if c and not _is_probably_numeric(c))
+        numeric_second = sum(1 for c in second_row if c and _is_probably_numeric(c))
+
+        if texty_first >= 1 and (numeric_second > 0 or texty_first >= texty_second):
+            return True
+
+        # Hvis cellene i første rad er th, er det enda sterkere indikasjon
+        first_tr = None
+        # vi har ikke direkte tilgang til tr her, så dette brukes ikke videre
+        return False
+
+    def _first_col_is_heading_col(matrix):
+        """
+        Heuristikk for om kolonne A (etter eventuell transponering) bør brukes som heading/etikett.
+        """
+        if not matrix or len(matrix) < 2:
+            return False
+
+        normalized = _normalize_matrix(matrix)
+        col_a = [row[0].strip() for row in normalized if row and row[0].strip()]
+        if len(col_a) < 2:
+            return False
+
+        # Ofte overskrift i første rad, etiketter under
+        data_col_a = col_a[1:] if _looks_like_header_row(normalized) else col_a
+        if not data_col_a:
+            return False
+
+        # Korte etiketter i første kolonne og lengre innhold i andre kolonner
+        short_labels = 0
+        comparable_rows = 0
+
+        for row in normalized[1:] if _looks_like_header_row(normalized) else normalized:
+            if not row:
+                continue
+            first = row[0].strip()
+            others = [c.strip() for c in row[1:] if c.strip()]
+            if not first:
+                continue
+            if not others:
+                continue
+            comparable_rows += 1
+            avg_other_len = sum(len(x) for x in others) / len(others)
+            if len(first) <= avg_other_len:
+                short_labels += 1
+
+        if comparable_rows == 0:
+            return False
+
+        return (short_labels / comparable_rows) >= 0.6
+
+    def _build_lines_from_matrix(matrix):
+        """
+        Lager lineære tekstlinjer fra en matrise.
+        Returnerer:
+            lines, used_header_row, first_col_heading
+        """
+        if not matrix:
+            return [], False, False
+
+        matrix = _normalize_matrix(matrix)
+        used_header_row = _looks_like_header_row(matrix)
+        first_col_heading = _first_col_is_heading_col(matrix)
+
+        header = matrix[0] if used_header_row else None
+        data_rows = matrix[1:] if used_header_row else matrix
+
+        lines = []
+
+        for row in data_rows:
+            row = [c.strip() for c in row]
+            if not any(row):
+                continue
+
+            if first_col_heading and row[0]:
+                label = row[0]
+                rest = row[1:]
+
+                pieces = []
+                for idx, value in enumerate(rest, start=1):
+                    if not value:
+                        continue
+
+                    header_label = ""
+                    if header and idx < len(header):
+                        header_label = header[idx].strip()
+
+                    # Hvis overskriften trengs for forståelsen, ta den med.
+                    # Første verdikolonne kan ofte stå uten overskrift hvis strukturen er enkel,
+                    # men ved 2+ verdikolonner er det ofte nyttig å ta med overskrift.
+                    if header_label and len(rest) > 1:
+                        pieces.append(f"{header_label}: {value}")
+                    else:
+                        pieces.append(value)
+
+                if pieces:
+                    line = f"{label}: " + "; ".join(pieces)
+                else:
+                    line = label
+
+            else:
+                pieces = [c for c in row if c]
+                line = "; ".join(pieces)
+
+            if line.strip():
+                lines.append(line.strip())
+
+        return lines, used_header_row, first_col_heading
+
+    def _score_lines(lines):
+        """
+        Lavest maksimal linjelengde er viktigst.
+        Deretter lavere gjennomsnitt.
+        Deretter færre semikolon.
+        """
+        if not lines:
+            return (10**9, 10**9, 10**9)
+
+        max_len = max(len(line) for line in lines)
+        avg_len = sum(len(line) for line in lines) / len(lines)
+        semicolons = sum(line.count(";") for line in lines)
+        return (max_len, avg_len, semicolons)
+
+    def _choose_best_orientation(matrix):
+        original_lines, original_has_header, original_first_col_heading = _build_lines_from_matrix(matrix)
+        transposed = _transpose_matrix(matrix)
+        transposed_lines, transposed_has_header, transposed_first_col_heading = _build_lines_from_matrix(transposed)
+
+        original_score = _score_lines(original_lines)
+        transposed_score = _score_lines(transposed_lines)
+
+        if transposed_lines and transposed_score < original_score:
+            return {
+                "matrix": transposed,
+                "lines": transposed_lines,
+                "orientation": "transposed",
+                "has_header_row": transposed_has_header,
+                "first_col_heading": transposed_first_col_heading,
+                "score": transposed_score,
+            }
+
+        return {
+            "matrix": matrix,
+            "lines": original_lines,
+            "orientation": "original",
+            "has_header_row": original_has_header,
+            "first_col_heading": original_first_col_heading,
+            "score": original_score,
+        }
+
+    def _make_table_as_text_block(table, result):
+        """
+        Lager HTML-erstatning for tabellen.
+        Holder det enkelt og lesbart for leselist:
+        <div class="table-as-list">
+            <p>...</p>
+            <p>...</p>
+        </div>
+        """
+        wrapper = soup.new_tag("div")
+        wrapper["class"] = ["table-as-list"]
+
+        # Behold caption hvis den finnes
+        caption = table.find("caption")
+        if caption:
+            caption_text = _cell_text(caption)
+            if caption_text:
+                p = soup.new_tag("p")
+                p.string = caption_text
+                wrapper.append(p)
+
+        for line in result["lines"]:
+            p = soup.new_tag("p")
+            p.string = line
+            wrapper.append(p)
+
+        return wrapper
+
+    def _should_convert_table_to_linear_text(table, matrix):
+        """
+        Heuristikk:
+        - konverter hvis tabellen har minst 2 rader og 2 kolonner
+        - og hvis lineariseringen virker nyttig
+        - særlig aktuelt når celler inneholder en del tekst eller tabellen er bred
+        """
+        if not matrix or len(matrix) < 2:
+            return False
+
+        normalized = _normalize_matrix(matrix)
+        row_count = len(normalized)
+        col_count = max(len(row) for row in normalized) if normalized else 0
+
+        if col_count < 2:
+            return False
+
+        # Tekstmengde
+        all_texts = [cell for row in normalized for cell in row if cell.strip()]
+        avg_cell_len = (sum(len(t) for t in all_texts) / len(all_texts)) if all_texts else 0
+
+        # Bred tabell eller tekstlig tabell
+        if col_count >= 4:
+            return True
+        if avg_cell_len >= 15:
+            return True
+
+        # To-raders / to-kolonne-tabeller kan ofte også egne seg
+        if row_count == 2 or col_count == 2:
+            return True
+
+        return False
+
+    if args.grade <= 8:
+        for table in soup.find_all("table"):
+            try:
+                matrix = _table_to_matrix(table)
+
+                if not _should_convert_table_to_linear_text(table, matrix):
+                    logger.debug("9.3 - Beholder tabell uendret (ikke egnet for linearisering)")
+                    continue
+
+                result = _choose_best_orientation(matrix)
+
+                if not result["lines"]:
+                    logger.debug("9.3 - Ingen lineære linjer generert, beholder tabell")
+                    continue
+
+                logger.info(
+                    "9.3 - Gjør tabell om til lineær tekst (%s, max_len=%s, avg_len=%.1f, first_col_heading=%s)",
+                    result["orientation"],
+                    result["score"][0],
+                    result["score"][1],
+                    result["first_col_heading"],
+                )
+
+                replacement = _make_table_as_text_block(table, result)
+                table.replace_with(replacement)
+
+            except Exception as e:
+                logger.warning("9.3 - Klarte ikke å linearisere tabell: %s", e)
+
+
 
     # 9.4 Tabell som relieff-figur #78
     # --------------------------------
@@ -1489,6 +1887,7 @@ def apply_requirements(soup, args, logger):
     # 14.4 De skal være på formen: Bokas tittel (antall sider) – Målform – Forfatter(e). #201
     # Ref. 08: Bokas tittel settes med tittelstil på første linje. På neste linje angis startside
     # og sluttside for det stoffet fra originalboka som er med i den tilrettelagte filen
+    '''
     logger.info('14.4 De skal være på formen: Bokas tittel (antall sider) – Målform – Forfatter(e) #201')
     if (titlepage := BODY.find('section', attrs={'epub:type': 'frontmatter titlepage'})):
         titlepage.clear()
@@ -1498,7 +1897,37 @@ def apply_requirements(soup, args, logger):
         p = soup.new_tag('p')
         p.string = f'side {metadata["pagenumbers"][0]} til {metadata["pagenumbers"][-1]}'
         titlepage.append(p)
+    '''
+    logger.info('14.4 De skal være på formen: Bokas tittel (antall sider) – Målform – Forfatter(e) #201')
 
+    if (titlepage := BODY.find('section', attrs={'epub:type': 'frontmatter titlepage'})):
+        titlepage.clear()
+
+        h1 = soup.new_tag('h1', attrs={'epub:type': 'fulltitle'})
+
+        title = (metadata.get('title') or '').strip()
+
+        pagenumbers = metadata.get('pagenumbers') or []
+        page_count_text = f'({len(pagenumbers)} sider)' if pagenumbers else ''
+
+        lang = (metadata.get('language') or '').strip().lower()
+        maalform = {'nb': 'Bokmål', 'nn': 'Nynorsk'}.get(lang, '')
+
+        authors = metadata.get('authors') or []
+        if len(authors) == 1:
+            author_text = (authors[0] or '').strip()
+        elif len(authors) > 1:
+            first = (authors[0] or '').strip()
+            surname = first.split()[-1] if first else ''
+            author_text = f'{surname} mfl.' if surname else 'mfl.'
+        else:
+            author_text = ''
+
+        first_part = ' '.join(part for part in [title, page_count_text] if part)
+        line = ' – '.join(part for part in [first_part, maalform, author_text] if part)
+
+        h1.string = line
+        titlepage.append(h1)
 
     # 4.5 Innholdsfortegnelse
     # To be removed in prepare_for_docx and added with pandoc
@@ -1527,9 +1956,12 @@ def apply_requirements(soup, args, logger):
             if parent.name == 'section':
                 if 'epub:type' in parent.attrs and 'backmatter' not in parent['epub:type']:
                     p = soup.new_tag('p')
-                    a = soup.new_tag('a', href=f'#{heading["id"]}')
-                    a.string = heading.get_text()
-                    p.append(a)
+                    if args.grade > 7: 
+                        a = soup.new_tag('a', href=f'#{heading["id"]}')
+                        a.string = heading.get_text()
+                        p.append(a)
+                    else:
+                        p.string = heading.get_text()
                     toc.append(p)
 
     first_lines.insert_after(toc)
