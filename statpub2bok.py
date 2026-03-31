@@ -1199,8 +1199,40 @@ def apply_requirements(soup, args, logger):
     # -------------------------------------------
     logger.info('6.1.1 Oppgavetegn og oppgavenummerering')
     for task_section in BODY('section', attrs={'class': 'task'}):
+        '''
         if (heading := task_section.find(re.compile('^h[1-6]$'))):
             heading.insert(0, NavigableString('>>> '))
+        '''
+
+        for exercise_number in task_section(attrs={'class': 'exercisenumber'}):
+            exercise_number.insert(0, NavigableString('>>> '))
+
+        for ol in section.find_all('ol'):
+            start = 1
+            if ol.has_attr('start'):
+                try:
+                    start = int(ol['start'])
+                except Exception:
+                    start = 1
+
+            items = ol.find_all('li', recursive=False)
+            for i, li in enumerate(items, start=start):
+                prefix = f'>>> {i}. '
+
+                # Unngå dobbel prefiks hvis metoden kjøres flere ganger
+                existing_text = li.get_text(' ', strip=True)
+                if existing_text.startswith(prefix.strip()):
+                    continue
+
+                # Sett inn prefiks først i <li>
+                if li.contents:
+                    first = li.contents[0]
+                    if isinstance(first, str):
+                        li.contents[0].replace_with(prefix + first)
+                    else:
+                        li.insert(0, prefix)
+                else:
+                    li.string = prefix
     
     # 6.3 Utfyllingsoppgaver #32
     # --------------------------
