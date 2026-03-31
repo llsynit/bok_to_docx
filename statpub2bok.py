@@ -1172,11 +1172,14 @@ def apply_requirements(soup, args, logger):
     # TODO: check if relevant for other formats
     # TODO: format glossaries
     if args.grade < 8:
-        for section in soup('section'):
-            if not section.find('section'): # Lowest section level
-                for aside in section(attrs={'class':'glossary'}):
-                    print('ORDFORKLARINGER')
-                    print(aside)
+        for glossary in soup(attrs={'class': 'glossary'}):
+            if (glossary_heading := glossary.find(re.compile('^h[1-6]$'))) and not glossary_heading.get_text().strip().endswith(':'):
+                glossary_heading.string = glossary_heading.get_text().strip() + ':'
+            for parent in glossary.parents:
+                if parent.name == 'section':
+                    if (heading := parent.find(re.compile('^h[1-6]$'))):
+                        heading.insert_after(glossary)
+                    break
 
     # 6 Oppgaver
     # ==========
