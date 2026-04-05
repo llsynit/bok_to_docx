@@ -1051,30 +1051,16 @@ def apply_requirements(soup, args, logger):
             element.string.replace_with(text)
     # TODO: optimize
 
-    '''
-
     # 4.16 Utheving
     # -------------
     logger.info('4.16 Utheving')
-    for emphasis in list(BODY.find_all(['em', 'strong'])):
-        # Hopp over elementer som ligger inni annen utheving
-        if args.grade < 8 and emphasis.find(attrs={'class': 'exercisenumber'}) is not None:
-            emphasis.unwrap()
-            continue
-        if 'dl' in [parent.name for parent in emphasis.parents]:
-            emphasis.unwrap()
-            continue
-        if emphasis.find_parent(['em', 'strong']) is not None:
-            continue
 
-        text = emphasis.get_text()
-        emphasis.replace_with(NavigableString(f'_{text}_'))
-    '''
+    # Addendum for args.grade < 8: No emphasis in tasks
+    for section in soup('section', attrs={'class':'task'}):
+        for emphasis in section(['em','strong']):
+            emphasis.unwrap()
 
-    # 4.16 Utheving
-    # -------------
-    logger.info('4.16 Utheving')
-    for emphasis in list(BODY.find_all(['em', 'strong'])):
+    for emphasis in list(BODY(['em', 'strong'])):
         # Hopp over elementer som ligger inni annen utheving
         if args.grade < 8 and emphasis.find(attrs={'class': 'exercisenumber'}) is not None:
             emphasis.unwrap()
