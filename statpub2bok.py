@@ -1056,6 +1056,7 @@ def apply_requirements(soup, args, logger):
     logger.info('4.16 Utheving')
 
     # Addendum for args.grade < 8: No emphasis in tasks
+    # Fixes #10
     for section in soup('section', attrs={'class':'task'}):
         for emphasis in section(['em','strong']):
             emphasis.unwrap()
