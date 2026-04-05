@@ -399,34 +399,6 @@ def format_number(number_str, grade):
 
     return formatted_number if formatted_number != number_str else None  # Return None if unchanged
 
-# 7.4
-def convert_quotes(text):
-    # TODO: grocer's apostrophe
-    """
-    Converts various types of quotation marks:
-    - «...» for main quotations.
-    - "..." for nested quotations inside «...».
-    - Ensures punctuation remains inside quotes (e.g., «Hello!» instead of «Hello»!).
-    """
-    # Skip processing if already uses « and »
-    if '«' in text or '»' in text:
-        return text
-
-    # Step 1: Replace all known opening quotes with «
-    text = re.sub(r'(^|\s)[“”„‚‘"]+', r'\1«', text)  # Normalize all opening quotes
-
-    # Step 2: Replace all closing quotes with » (including when followed by punctuation)
-    text = re.sub(r'([^\s])"([.!?,;:]?)', r'\1»\2', text)  # Handles `"Hello!"` → `«Hello!»`
-
-    # Step 3: Ensure nested quotes inside «...» use straight double quotes ("...")
-    text = re.sub(r'«([^«»]*)‘([^«»]*)’([^«»]*)»', r'«\1"\2"\3»', text)  # Converts ‘...’ to "..."
-    text = re.sub(r'«([^«»]*)“([^«»]*)”([^«»]*)»', r'«\1"\2"\3»', text)  # Converts “...” to "..."
-
-    # Step 4: Preserve apostrophes in contractions
-    text = re.sub(r'\b(\w)»(\w)\b', r"\1’\2", text)  # Restores apostrophes where needed
-
-    return text
-
 def is_valid_ipa(text):
     """
     Checks if the given text is a valid IPA phonetic transcription.
@@ -1079,6 +1051,8 @@ def apply_requirements(soup, args, logger):
             element.string.replace_with(text)
     # TODO: optimize
 
+    '''
+
     # 4.16 Utheving
     # -------------
     logger.info('4.16 Utheving')
@@ -1094,6 +1068,24 @@ def apply_requirements(soup, args, logger):
             continue
 
         text = emphasis.get_text()
+        emphasis.replace_with(NavigableString(f'_{text}_'))
+    '''
+
+    # 4.16 Utheving
+    # -------------
+    logger.info('4.16 Utheving')
+    for emphasis in list(BODY.find_all(['em', 'strong'])):
+        # Hopp over elementer som ligger inni annen utheving
+        if args.grade < 8 and emphasis.find(attrs={'class': 'exercisenumber'}) is not None:
+            emphasis.unwrap()
+            continue
+        if 'dl' in [parent.name for parent in emphasis.parents]:
+            emphasis.unwrap()
+            continue
+        if emphasis.find_parent(['em', 'strong']) is not None:
+            continue
+
+        text = emphasis.get_text().strip()
         emphasis.replace_with(NavigableString(f'_{text}_'))
 
 
@@ -1207,7 +1199,7 @@ def apply_requirements(soup, args, logger):
         for exercise_number in task_section(attrs={'class': 'exercisenumber'}):
             exercise_number.insert(0, NavigableString('>>> '))
 
-        for ol in section.find_all('ol'):
+        for ol in task_section('ol'):
             start = 1
             if ol.has_attr('start'):
                 try:
@@ -1215,7 +1207,7 @@ def apply_requirements(soup, args, logger):
                 except Exception:
                     start = 1
 
-            items = ol.find_all('li', recursive=False)
+            items = ol('li', recursive=False)
             for i, li in enumerate(items, start=start):
                 prefix = f'>>> {i}. '
 
@@ -1306,15 +1298,28 @@ def apply_requirements(soup, args, logger):
     """
     Iterates through all text elements and converts various types of quotation marks.
     """
+    # BUG: _forsto ‘kje, snårete, vase rundt, gomla, hug_ -> _forsto "kje, snårete, vase rundt, gomla, hug_
     logger.info('7.4 Anførselstegn')
     for element in BODY(string=True):
-        if element.parent.name in ["code", "pre"] or 'asciimath' in element.parent.get('class', []):
+        if element.parent.name in ["math", "code", "pre"] or 'asciimath' in element.parent.get('class', []):
             continue
 
-        updated_text = convert_quotes(element)
+        #updated_text = convert_quotes(element)
+        text = element
+        if args.grade < 8:
+            text = re.sub(r'(^|\s)[“”„‚‘"]+', r'\1"', text)  # Normalize all opening quotes
+            text = re.sub(r'«([^«»]*)‘([^«»]*)’([^«»]*)»', r'"\1«\2»\3"', text)  # Converts ‘...’ to "..."
+            text = re.sub(r'«([^«»]*)“([^«»]*)”([^«»]*)»', r'"\1«\2»\3"', text)  # Converts “...” to "..."
+            text = re.sub(r'\b(\w)"(\w)\b', r"\1’\2", text)  # Restores apostrophes where needed
+        else:
+            text = re.sub(r'(^|\s)[“”„‚‘"]+', r'\1«', text)  # Normalize all opening quotes
+            text = re.sub(r'([^\s])"([.!?,;:]?)', r'\1»\2', text)  # Handles `"Hello!"` → `«Hello!»`
+            text = re.sub(r'«([^«»]*)‘([^«»]*)’([^«»]*)»', r'«\1"\2"\3»', text)  # Converts ‘...’ to "..."
+            text = re.sub(r'«([^«»]*)“([^«»]*)”([^«»]*)»', r'«\1"\2"\3»', text)  # Converts “...” to "..."
+            text = re.sub(r'\b(\w)»(\w)\b', r"\1’\2", text)  # Restores apostrophes where needed
 
-        if updated_text != element:
-            element.replace_with(updated_text)
+        if text != element:
+            element.replace_with(text)
 
     # 7.5 Spesialtegn
     # ---------------
@@ -1419,6 +1424,13 @@ def apply_requirements(soup, args, logger):
     # TODO: Chapter 8
     # For now, this is implemented by sorting caption and alt-text. 
 
+    IMAGE_TAGS = [
+            # English
+            'photo','illustration','figure','symbol','map','drawing','comic','logo',
+            # Norwegian
+            'foto','illustrasjon','figur','symbol','kart','tegning','tegneserie','logo',
+            ]
+
     for figure in soup('figure'):
         main_figure = figure
         for parent in figure.parents:
@@ -1443,7 +1455,7 @@ def apply_requirements(soup, args, logger):
         alt_text = None 
         if (img := figure.find('img')) and 'alt' in img.attrs:
             alt_text = img['alt']
-            if alt_text not in ['Figur']:
+            if alt_text.lower() not in IMAGE_TAGS:
                 p = soup.new_tag('p')
                 p.string = alt_text
                 main_figure.insert_before(p)
