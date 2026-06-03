@@ -67,6 +67,7 @@ async def process(file: UploadFile, config: UploadFile, file2: Optional[UploadFi
         logger.info(f"/process inside {module_name} started")
 
         config_data = json.loads(await config.read())
+        logger.info(f'config_data: {config_data}')
 
         def to_bool(val):
             return str(val).lower() == "true"
