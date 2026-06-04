@@ -72,17 +72,7 @@ async def process(file: UploadFile, config: UploadFile, file2: Optional[UploadFi
         def to_bool(val):
             return str(val).lower() == "true"
         
-        def trinn_to_grade(trinn_list):
-            mapping = {
-                "Barnehage": 0, "1.kl": 1, "2.kl": 2, "3.kl": 3,
-                "4.kl": 4, "5.kl": 5, "6.kl": 6, "7.kl": 7,
-                "8.kl": 8, "9.kl": 9, "10.kl": 10,
-                "Vg1": 11, "Vg2": 12, "Vg3": 13
-            }
-            grades = [mapping[t] for t in trinn_list if t in mapping]
-            return max(grades) if grades else None
-
-        grade=trinn_to_grade(config_data.get("trinn", []))
+        grade= config_data['trinn'][0] if 'trinn' in config_data.keys() else None
         mathematics=to_bool(config_data.get("mathematics", False))
         science=to_bool(config_data.get("science", False))
         no_excel=to_bool(config_data.get("no_excel", True))
