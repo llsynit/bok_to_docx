@@ -1139,6 +1139,28 @@ class CleanArgs:
     grade: Optional[int] = None
 
 
+def format_about_book_from_margin(document: Document) -> Document:
+    """All paragraphs under the final «Om boka» heading start at the margin.
+
+    Stop at the next heading («Opphavsrett»), so copyright prose retains
+    its own formatting. This also normalizes any list numbering indentation.
+    """
+    inside = False
+    for paragraph in document.paragraphs:
+        value = ' '.join((paragraph.text or '').split()).casefold().rstrip('.:')
+        if value == 'om boka':
+            inside = True
+        elif inside and value == 'opphavsrett':
+            break
+        if inside:
+            _set_paragraph_from_margin(paragraph, document, use_normal_no_indent=False)
+            # List numbering in Word can override paragraph indentation.
+            ppr = paragraph._p.pPr
+            if ppr is not None and ppr.numPr is not None:
+                ppr.remove(ppr.numPr)
+    return document
+
+
 def remove_duplicate_opening_title(document: Document) -> Document:
     """Remove only an adjacent duplicate of the document's opening title.
 
@@ -1757,6 +1779,7 @@ def xhtml_to_docx(
         doc = clean_document(doc, clean_args, args.logger)
         doc = remove_duplicate_opening_title(doc)
         doc = normalize_margin_layout(doc, args.logger, grade=grade)
+        doc = format_about_book_from_margin(doc)
 
         # output as bytes
         final_docx = tmp / Path(output_filename).name
@@ -1850,6 +1873,7 @@ def convert(args):
             doc = clean_document(doc, args)
             doc = remove_duplicate_opening_title(doc)
             doc = normalize_margin_layout(doc, args.logger, grade=args.grade)
+            doc = format_about_book_from_margin(doc)
         except Exception as e:
             args.logger.error("DOCX-etterbehandling feilet: %s", e)
             return 1
