@@ -1139,6 +1139,30 @@ class CleanArgs:
     grade: Optional[int] = None
 
 
+def remove_duplicate_opening_title(document: Document) -> Document:
+    """Remove only an adjacent duplicate of the document's opening title.
+
+    Pandoc can emit the XHTML head/title as a Word Title paragraph in
+    addition to the explicit first body paragraph generated upstream.
+    Preserve the Title-styled paragraph and the following page-range line.
+    """
+    paragraphs = document.paragraphs
+    if len(paragraphs) < 2:
+        return document
+    first, second = paragraphs[0], paragraphs[1]
+    def normalize(value: str) -> str:
+        return " ".join(value.split()).casefold()
+    if (first.style is not None
+            and first.style.name.casefold() == "title"
+            and normalize(first.text)
+            and normalize(first.text) == normalize(second.text)
+            and second.style is not None
+            and second.style.name.casefold() != "title"):
+        second._element.getparent().remove(second._element)
+        logger.info("Removed duplicate opening title paragraph inserted alongside Pandoc title")
+    return document
+
+
 def clean_document(document: Document, args: CleanArgs) -> Document:
     """
     Rydder i DOCX-innholdet:
@@ -1731,6 +1755,7 @@ def xhtml_to_docx(
         # clean
         doc = Document(str(out_docx))
         doc = clean_document(doc, clean_args, args.logger)
+        doc = remove_duplicate_opening_title(doc)
         doc = normalize_margin_layout(doc, args.logger, grade=grade)
 
         # output as bytes
@@ -1823,6 +1848,7 @@ def convert(args):
         try:
             doc = Document(str(out_docx_tmp))
             doc = clean_document(doc, args)
+            doc = remove_duplicate_opening_title(doc)
             doc = normalize_margin_layout(doc, args.logger, grade=args.grade)
         except Exception as e:
             args.logger.error("DOCX-etterbehandling feilet: %s", e)
