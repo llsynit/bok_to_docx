@@ -61,13 +61,15 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 # --- lokale imports ---------------------------------------------------------------
-from statpub2bok import apply_requirements
+#from statpub2bok import apply_requirements
+
 
 # --- Konstanter / miljø -------------------------------------------------------
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PANDOC_BIN = os.getenv("PANDOC_BIN", "pandoc")
 TEMPLATE_JUNIOR = "TEMPLATE_JUNIOR.docx"
-TEMPLATE_SENIOR = "TEMPLATE_SENIOR.docx"
+#TEMPLATE_SENIOR = "TEMPLATE_SENIOR.docx"
+TEMPLATE_SENIOR = "TEMPLATE_SENIOR.dotm"
 
 THIS_DIR = Path(__file__).resolve().parent
 STATIC_DIR = THIS_DIR / "static"
@@ -78,6 +80,10 @@ EMPTY = "blank_line"
 NOINDENT = "NOINDENT"
 TOINN = "TOINN"
 NUMBER_PREFIX = "--- "
+GLOSSARY_ENTRY_PREFIX = "STATPED_GLOSSARY_ENTRY::"
+TOC_LEVEL_PREFIX = "STATPED_TOC_LEVEL::"
+TOC_INDENT_STEP_PT = 18  # 0,635 cm per nivå etter nivå 1
+GLOSSARY_HANGING_INDENT_PT = 18  # 360 twips / 0,635 cm
 
 DEFAULT_GRADE = 8  # barnetrinn-regel (fontvalg mm i clean)
 FONT_NAME_JUNIOR = "Courier New"
@@ -191,6 +197,272 @@ def _prepend_blank_line(soup, element):
     element.insert_before(empty_p)
 
 
+def _normalize_inline_text(element) -> str:
+    """Hent lesbar tekst med ett mellomrom mellom tekstfragmentene."""
+    return " ".join(element.get_text(" ", strip=True).split())
+
+
+def _definition_list_groups(dl):
+    """
+    Del en HTML-definisjonsliste i grupper av én/flere termer og forklaringer.
+
+    HTML tillater både flere dt før samme dd og flere dd etter samme dt. Hver
+    gruppe returneres derfor som (terms, definitions), slik at vi ikke mister
+    innhold når kildedataene bruker en av disse variantene.
+    """
+    items = dl.find_all(["dt", "dd"], recursive=False)
+    if not items:
+        # Tåler et unødvendig wrapper-element rundt dt/dd.
+        items = dl.find_all(["dt", "dd"])
+
+    groups = []
+    terms = []
+    definitions = []
+
+    def flush():
+        nonlocal terms, definitions
+        if terms or definitions:
+            groups.append((terms, definitions))
+        terms = []
+        definitions = []
+
+    for item in items:
+        text = _normalize_inline_text(item)
+        if not text:
+            continue
+
+        if item.name == "dt":
+            if definitions:
+                flush()
+            terms.append(text)
+        else:
+            definitions.append(text)
+
+    flush()
+    return groups
+
+
+def _ensure_definition_list_aside_markers(soup: BeautifulSoup) -> None:
+    """
+    Sørg for faste ordlistemarkører rundt en dl som ligger i en aside.
+
+    Funksjonen håndterer både rå XHTML uten markører og XHTML som allerede er
+    behandlet av en eldre statpub_to_bok-versjon. Den eldre versjonen kunne
+    bruke teksten før det første kolonet i en dd som rammenavn.
+    """
+    for aside in soup.find_all("aside"):
+        if aside.find("dl") is None:
+            continue
+
+        direct_children = [
+            child
+            for child in aside.children
+            if getattr(child, "name", None) is not None
+        ]
+
+        def is_blank_line(element) -> bool:
+            classes = element.get("class", [])
+            return (
+                "blank_line" in classes
+                or not element.get_text(" ", strip=True)
+            )
+
+        content_children = [
+            child for child in direct_children if not is_blank_line(child)
+        ]
+        if not content_children:
+            continue
+
+        first = content_children[0]
+        last = content_children[-1]
+        first_text = _normalize_inline_text(first).casefold()
+        last_text = _normalize_inline_text(last).casefold()
+
+        # Har statpub_to_bok allerede satt inn en sluttmarkør, er første
+        # innholdselement den tilhørende startmarkøren – også når teksten der
+        # ble feilaktig hentet fra dl-innholdet.
+        previously_framed = (
+            last.name == "p" and last_text.endswith("slutt")
+        )
+
+        if previously_framed and first.name == "p":
+            first.clear()
+            first.string = "Ordliste:"
+        elif first.name == "p" and first_text.startswith("ordliste:"):
+            first.clear()
+            first.string = "Ordliste:"
+        else:
+            opening = soup.new_tag("p")
+            opening.string = "Ordliste:"
+            first.insert_before(opening)
+
+        if previously_framed:
+            last.clear()
+            last.string = "Ordliste slutt"
+        else:
+            closing = soup.new_tag("p")
+            closing.string = "Ordliste slutt"
+            # Sett sluttmarkøren før en eventuell avsluttende blank_line.
+            content_children[-1].insert_after(closing)
+
+
+def _convert_definition_lists_to_glossary_paragraphs(soup: BeautifulSoup) -> None:
+    """
+    Gjør dl/dt/dd om til vanlige avsnitt før Pandoc.
+
+    Et internt prefiks følger hvert oppslagsavsnitt gjennom Pandoc. Prefikset
+    fjernes i DOCX-etterbehandlingen og brukes til å skille selve oppslagene
+    fra for eksempel sidetall og innledningen «Ordforklaringer:».
+    """
+    for dl in list(soup.find_all("dl")):
+        replacement_paragraphs = []
+
+        for terms, definitions in _definition_list_groups(dl):
+            definition = "; ".join(definitions).strip()
+
+            if terms:
+                for term in terms:
+                    term = term.rstrip().rstrip(":").rstrip()
+                    text = f"{term}: {definition}" if definition else f"{term}:"
+                    paragraph = soup.new_tag("p")
+                    paragraph.string = f"{GLOSSARY_ENTRY_PREFIX}{text}"
+                    replacement_paragraphs.append(paragraph)
+            elif definition:
+                paragraph = soup.new_tag("p")
+                paragraph.string = f"{GLOSSARY_ENTRY_PREFIX}{definition}"
+                replacement_paragraphs.append(paragraph)
+
+        for paragraph in replacement_paragraphs:
+            dl.insert_before(paragraph)
+        dl.decompose()
+
+
+
+
+def _split_explicit_exercise_parts_into_paragraphs(soup: BeautifulSoup) -> None:
+    """
+    Splitt oppgaveavsnitt som allerede har semantiske markører til egne <p>.
+
+    Eksempel:
+      <p><span class="exercisenumber">>>> 1.</span><br/> Intro
+         <span class="excercisepart">a.</span> ...
+         <span class="excercisepart">b.</span> ...</p>
+
+    blir til ett avsnitt for oppgavenummeret, ett for innledningen og ett for
+    hver underoppgave. Inline-markup i hvert segment beholdes. Vi støtter både
+    den etablerte (feilstavede) klassen ``excercisepart`` og ``exercisepart``.
+    """
+    part_classes = {"excercisepart", "exercisepart"}
+
+    def is_part_marker(node) -> bool:
+        if getattr(node, "name", None) != "span":
+            return False
+        classes = set(node.get("class", []))
+        return bool(classes & part_classes)
+
+    def is_number_marker(node) -> bool:
+        return (
+            getattr(node, "name", None) == "span"
+            and "exercisenumber" in set(node.get("class", []))
+        )
+
+    def segment_has_content(nodes) -> bool:
+        for node in nodes:
+            if isinstance(node, NavigableString):
+                if str(node).strip():
+                    return True
+            elif getattr(node, "name", None) == "br":
+                continue
+            elif getattr(node, "get_text", None):
+                if node.get_text(" ", strip=True):
+                    return True
+        return False
+
+    def trim_segment(nodes):
+        nodes = list(nodes)
+        while nodes:
+            first = nodes[0]
+            if getattr(first, "name", None) == "br":
+                nodes.pop(0)
+                continue
+            if isinstance(first, NavigableString) and not str(first).strip():
+                nodes.pop(0)
+                continue
+            break
+        while nodes:
+            last = nodes[-1]
+            if getattr(last, "name", None) == "br":
+                nodes.pop()
+                continue
+            if isinstance(last, NavigableString) and not str(last).strip():
+                nodes.pop()
+                continue
+            break
+        return nodes
+
+    # list(...) fordi DOM-en muteres underveis.
+    for paragraph in list(soup.find_all("p")):
+        children = list(paragraph.contents)
+        if not any(is_number_marker(n) for n in children):
+            continue
+
+        # Vi splitter bare når oppgavenummeret faktisk er et direkte barn av p.
+        # Dermed unngår vi å rive fra hverandre mer komplisert nested markup.
+        number_index = next((i for i, n in enumerate(children) if is_number_marker(n)), None)
+        if number_index is None:
+            continue
+
+        segments = []
+        current = []
+        kind = "prefix"
+
+        for node in children:
+            if is_number_marker(node):
+                if segment_has_content(current):
+                    segments.append((kind, trim_segment(current)))
+                current = [node]
+                kind = "number"
+                continue
+
+            if is_part_marker(node):
+                if segment_has_content(current):
+                    segments.append((kind, trim_segment(current)))
+                current = [node]
+                kind = "part"
+                continue
+
+            # <br> rett etter oppgavenummeret er bare separator og skal ikke
+            # bli med inn i neste avsnitt.
+            if kind == "number" and getattr(node, "name", None) == "br":
+                if segment_has_content(current):
+                    segments.append((kind, trim_segment(current)))
+                current = []
+                kind = "intro"
+                continue
+
+            current.append(node)
+
+        if segment_has_content(current):
+            segments.append((kind, trim_segment(current)))
+
+        # Ingen faktisk splitting nødvendig.
+        if len(segments) <= 1:
+            continue
+
+        for _kind, nodes in segments:
+            if not segment_has_content(nodes):
+                continue
+            new_p = soup.new_tag("p")
+            # Behold relevante attributter på originalavsnittet (lang, dir osv.).
+            for key, value in paragraph.attrs.items():
+                new_p.attrs[key] = value
+            for node in nodes:
+                new_p.append(node.extract() if getattr(node, "parent", None) is not None else node)
+            paragraph.insert_before(new_p)
+
+        paragraph.decompose()
+
+
 def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
     print(args)
     """
@@ -205,7 +477,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
 
     if args.book or not is_book(soup):
         logger.info(f'Applying conversions from statpub_to_bok for {args.book}')
-        soup = run_statpub_to_bok_conversions(soup, args, logger)
+        #soup = run_statpub_to_bok_conversions(soup, args, logger)
 
     if args.grade and isinstance(args.grade, int):
         args.grade = int(args.grade)
@@ -219,105 +491,30 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
 
     logger.info(f'Assumed grade level: {args.grade}')
 
+    # En aside med dl skal alltid ha de faste markørene «Ordliste:» og
+    # «Ordliste slutt», også dersom en eldre statpub_to_bok allerede har satt
+    # inn feil markørtekst.
+    _ensure_definition_list_aside_markers(soup)
 
+    # Pandoc gir dl/dt/dd sitt eget definisjonslisteoppsett. Gjør derfor hvert
+    # oppslag om til ett vanlig, merket avsnitt før konverteringen. Den endelige
+    # marg-/hengende-formateringen settes i DOCX etter Pandoc.
+    _convert_definition_lists_to_glossary_paragraphs(soup)
+
+    # Oppgaver kan være pakket i ett XHTML-avsnitt. Splitt eksplisitt merkede
+    # oppgavenummer/underoppgaver før Pandoc, slik at hvert punkt blir et ekte
+    # DOCX-avsnitt og kan starte fra margen.
+    _split_explicit_exercise_parts_into_paragraphs(soup)
+
+    # Remove pagebreak tags
+    for pagebreak in soup(attrs={'epub:type':'pagebreak'}):
+        pagebreak.decompose()
 
     if args.production_number == DEFAULT_PRODUCTION_NUMBER:
         args.production_number = find_production_number(soup)
         args.logger.warning("Produksjonsnummer ikke funnet i metadata, bruker fallback: %s", args.production_number)
 
 
-    # Moved to statpub_to_bok
-    '''
-    # 4.12 – sidetall (epub:type=pagebreak) → ‘--- <id|title>’
-    args.logger.info("4.12 Sidetall")
-    for pagebreak in soup(attrs={"epub:type": "pagebreak"}):
-        insert_after = pagebreak
-        p = soup.new_tag("p")
-        if "title" in pagebreak.attrs:
-            p.string = f"{NUMBER_PREFIX}{pagebreak['title']}"
-        elif "id" in pagebreak.attrs:
-            p.string = f"{NUMBER_PREFIX}{pagebreak['id'].split('-')[-1]}"
-        else:
-            p.string = f"{NUMBER_PREFIX}".rstrip()
-
-        # sett etter nærmeste p hvis pagebreak var inni et avsnitt
-        for parent in pagebreak.parents:
-            if parent.name == "p":
-                insert_after = parent
-                break
-
-        insert_after.insert_after(p)
-        pagebreak.decompose()
-
-        # flytt opp om vi står rett inni section
-        if p.parent and p.parent.name == "section":
-            nxt = p.find_next_sibling()
-            if nxt and nxt.name in ("p", "section", "div"):
-                nxt.insert_before(p)
-    '''
-
-    # Moved to statpub_to_bok
-    '''
-    # 4.14 – blank linje over innholdsfortegnelse/frontmatter toc
-    args.logger.info("4.14 Blank linje over innholdsfortegnelse")
-    toc = soup.find("section", attrs={"epub:type": ["frontmatter toc", "toc", "frontmatter"]})
-    if toc:
-        if toc.previous_sibling and getattr(toc.previous_sibling, "name", None):
-            _prepend_blank_line(soup, toc)
-
-    # Blank linje over overskrifter, unntatt når overskrifter følger rett etter hverandre
-    args.logger.info("4.14 Blank linje over overskrifter")
-    for h in soup.find_all(re.compile(r"^h[1-6]$")):
-        prev = h.find_previous_sibling()
-        if prev and getattr(prev, "name", None) and not re.match(r"^h[1-6]$", prev.name or ""):
-            _prepend_blank_line(soup, h)
-    '''
-
-    
-    '''
-    # Bilder/figurer → “Bilde: <alt>”
-    args.logger.info("8.x Bilder/figurer")
-    for fig in soup.find_all("figure"):
-        # Finn img/alt
-        alt = None
-        img = fig.find("img")
-        if img and img.has_attr("alt"):
-            alt = img["alt"]
-        if img:
-            img.decompose()
-        # Sett inn “Bilde: …” før figuren
-        p = soup.new_tag("p")
-        p.string = "Bilde:" + (f" {alt}" if alt else "")
-        fig.insert_before(p)
-    
-    for fig in soup.find_all("figure"):
-        fig.decompose()
-
-    for img in soup.find_all("img"):
-        # Unngå duplikat hvis allerede håndtert via <figure>
-        if not img.find_parent("figure"):
-            alt = img.get("alt", "")
-            p = soup.new_tag("p")
-            p.string = "Bilde:" + (f" {alt}" if alt else "")
-            img.insert_before(p)
-            img.decompose()
-    '''
-
-    # Moved to statpub_to_bok
-    '''
-    # Oppgavetegn “>>>” → blank linje foran og etter
-    args.logger.info("4.1 Blank linje rundt oppgaver (>>>)")
-    for p in soup.find_all("p"):
-        text = p.get_text(strip=True)
-        if text.startswith(">>>"):
-            prev = p.previous_sibling
-            if prev and getattr(prev, "name", None) != "p":
-                _prepend_blank_line(soup, p)
-            # blank etter
-            empty_after = soup.new_tag("p")
-            empty_after.string = EMPTY
-            p.insert_after(empty_after)
-    '''
 
     # Excel-lignende tabeller: trekk dem ut (om ikke slått av)
     if not args.no_excel:
@@ -348,6 +545,60 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
             t.insert_before(repl)
             t.decompose()
 
+    # Innholdsfortegnelse:
+    # Behold hierarkiet, men gjør listepunktene til vanlige avsnitt slik at
+    # Pandoc ikke lager irrelevante Word-listenumre. Hvert avsnitt merkes med
+    # TOC-nivå; nivå 1 skal fra marg, nivå 2 ett innrykk, nivå 3 to innrykk osv.
+    #
+    # Vi går bare gjennom direkte <li>-barn på hvert nivå. Dermed blir nivået
+    # bestemt av den faktiske nesting-en i XHTML-en, ikke av tekstinnholdet.
+    def _flatten_toc_list(list_tag, replacement, level=1):
+        for li in list_tag.find_all("li", recursive=False):
+            p = soup.new_tag("p")
+            p.append(NavigableString(f"{TOC_LEVEL_PREFIX}{level}::"))
+
+            # Eget inline-innhold i dette <li>-elementet. Underlister og
+            # selvstendige blokkavsnitt behandles separat nedenfor.
+            for child in list(li.contents):
+                name = getattr(child, "name", None)
+                if name in ("ol", "ul", "p", "div"):
+                    continue
+                try:
+                    p.append(child.__copy__())
+                except Exception:
+                    p.append(NavigableString(str(child)))
+
+            # Ikke opprett et tomt TOC-avsnitt dersom <li> bare er wrapper
+            # rundt en underliste.
+            own_text = p.get_text(" ", strip=True)
+            marker_only = f"{TOC_LEVEL_PREFIX}{level}::"
+            if own_text != marker_only:
+                replacement.append(p)
+
+            # Behold eventuelle direkte blokkavsnitt i riktig rekkefølge.
+            # Dette gjelder bl.a. blank_line og "--- N" som kan ligge inne i
+            # et <li>. De skal ikke arve TOC-innrykket.
+            for child in list(li.children):
+                if getattr(child, "name", None) == "p":
+                    replacement.append(child.__copy__())
+
+                elif getattr(child, "name", None) in ("ol", "ul"):
+                    _flatten_toc_list(child, replacement, level + 1)
+
+    for toc in list(soup.find_all(attrs={"epub:type": "toc"})):
+        replacement = soup.new_tag("div")
+        replacement["epub:type"] = "toc"
+
+        # Vanligvis er selve TOC-elementet en <ol>, men håndter også en
+        # section/div som inneholder en eller flere topplister.
+        if toc.name in ("ol", "ul"):
+            _flatten_toc_list(toc, replacement, level=1)
+        else:
+            for top_list in toc.find_all(["ol", "ul"], recursive=False):
+                _flatten_toc_list(top_list, replacement, level=1)
+
+        toc.replace_with(replacement)
+
     # Quick fixes
     for blank_line in soup(attrs={'class':EMPTY}):
         blank_line.string = EMPTY
@@ -356,6 +607,7 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
     # <ul>
     if args.grade and args.grade < 8:
 
+        '''
         def _li_own_text(li):
             """Tekst i <li> uten å ta med nested <ul>/<ol>."""
             parts = []
@@ -369,56 +621,275 @@ def prepare_soup(soup: BeautifulSoup, args: ArgumentParser) -> BeautifulSoup:
                 if txt:
                     parts.append(txt)
             return " ".join(parts).strip()
+        '''
+
+        def _li_own_blocks(li):
+            """
+            Returnerer direkte innhold i <li> i faktisk rekkefølge.
+
+            Blokktyper:
+              ("text", "...")          vanlig tekst
+              ("blank", "")            blank_line
+              ("image", "Bilde: ...")  bilde
+              ("explanation", "...")   forklaring/prodnote
+              ("list", <ul/ol>)        underliste
+
+            Viktig:
+            - Håndterer både <figure> og <div class="figure">.
+            - Legger blank linje før og etter bilder i lister.
+            - Flater ikke ut bildeblokker med get_text().
+            """
+            blocks = []
+
+            def norm(text):
+                return " ".join((text or "").split()).strip()
+
+            def add_blank():
+                if not blocks or blocks[-1][0] != "blank":
+                    blocks.append(("blank", ""))
+
+            def add_text(text):
+                text = norm(text)
+                if not text:
+                    return
+
+                if text == EMPTY:
+                    add_blank()
+                else:
+                    blocks.append(("text", text))
+
+            def is_generic_alt(text):
+                return norm(text).lower() in {
+                    "tegning",
+                    "bilde",
+                    "illustrasjon",
+                    "foto",
+                    "figur",
+                    "drawing",
+                    "image",
+                    "illustration",
+                    "photo",
+                    "figure",
+                }
+
+            def handle_original_figure(fig):
+                """
+                Håndterer opprinnelig <figure> fra XHTML:
+                  <figure>
+                    <img alt="..."/>
+                    <aside class="prodnote">...</aside>
+                  </figure>
+                """
+                add_blank()
+
+                img = fig.find("img")
+                aside = fig.find("aside", class_="prodnote")
+
+                alt = norm(img.get("alt", "")) if img else ""
+                explanation = norm(aside.get_text(" ", strip=True)) if aside else ""
+
+                if alt and not is_generic_alt(alt):
+                    blocks.append(("image", f"Bilde: {alt}"))
+                else:
+                    blocks.append(("image", "Bilde:"))
+
+                if explanation:
+                    blocks.append(("explanation", f"Forklaring: {explanation}"))
+
+                add_blank()
+
+            def handle_converted_figure(fig):
+                """
+                Håndterer statpub_to_bok-format:
+                  <div class="figure">
+                    <p>Bilde:</p>
+                    <p>Forklaring: ...</p>
+                  </div>
+                """
+                add_blank()
+
+                for p in fig.find_all("p", recursive=False):
+                    txt = norm(p.get_text(" ", strip=True))
+
+                    if not txt:
+                        continue
+
+                    if txt == EMPTY or EMPTY in p.get("class", []):
+                        add_blank()
+                        continue
+
+                    if txt.startswith("Bilde:"):
+                        blocks.append(("image", txt))
+                        continue
+
+                    if txt.startswith("Forklaring:"):
+                        blocks.append(("explanation", txt))
+                        continue
+
+                    blocks.append(("text", txt))
+
+                add_blank()
+
+            for child in li.contents:
+                name = getattr(child, "name", None)
+
+                if isinstance(child, NavigableString):
+                    add_text(str(child))
+                    continue
+
+                if name in ("ul", "ol"):
+                    blocks.append(("list", child))
+                    continue
+
+                if hasattr(child, "get") and EMPTY in child.get("class", []):
+                    add_blank()
+                    continue
+
+                if name == "p":
+                    add_text(child.get_text(" ", strip=True))
+                    continue
+
+                if name == "figure":
+                    handle_original_figure(child)
+                    continue
+
+                if name == "div" and "figure" in child.get("class", []):
+                    handle_converted_figure(child)
+                    continue
+
+                if name == "img":
+                    add_blank()
+                    alt = norm(child.get("alt", ""))
+                    if alt and not is_generic_alt(alt):
+                        blocks.append(("image", f"Bilde: {alt}"))
+                    else:
+                        blocks.append(("image", "Bilde:"))
+                    add_blank()
+                    continue
+
+                if name == "aside":
+                    txt = norm(child.get_text(" ", strip=True))
+                    if txt:
+                        blocks.append(("explanation", f"Forklaring: {txt}"))
+                    continue
+
+                # Fallback, men ikke for elementer som inneholder figure/div.figure.
+                # Da må vi ikke flate ut bildeinnhold.
+                if hasattr(child, "find") and (
+                    child.find("figure") or child.find("div", class_="figure")
+                ):
+                    for sub in child.contents:
+                        sub_name = getattr(sub, "name", None)
+
+                        if isinstance(sub, NavigableString):
+                            add_text(str(sub))
+                        elif sub_name == "figure":
+                            handle_original_figure(sub)
+                        elif sub_name == "div" and "figure" in sub.get("class", []):
+                            handle_converted_figure(sub)
+                        elif sub_name == "p":
+                            add_text(sub.get_text(" ", strip=True))
+                        elif sub_name in ("ul", "ol"):
+                            blocks.append(("list", sub))
+                    continue
+
+                if hasattr(child, "get_text"):
+                    add_text(child.get_text(" ", strip=True))
+
+            return blocks
+
+
 
         def _render_list(list_tag, depth=0):
             """
-            Returnerer en <div> med <p>-linjer for hele lista (rekursivt).
+            Returnerer en <div> med <p>-linjer for hele lista rekursivt.
 
-            - Uordnet: '-- ' + innrykk
-            - Ordnet: '1.' eller 'a.' + innrykk (hvis type="a")
-            - Hvis et <li> ikke har egen tekst, men bare en underliste,
-              så "promoteres" underlista til samme nivå (depth uendret).
+            Barnetrinnsformat:
+                -- punkt
+                -- punkt
+                  -- underpunkt
+                    -- under-underpunkt
+                -- punkt
+
+                Bilde: ...
+                Forklaring: ...
+
+                -- enda et punkt
             """
             new_div = soup.new_tag("div")
 
-            is_ordered = (list_tag.name == "ol")
-            type_attr = (list_tag.get("type") or "").lower() if is_ordered else ""
+            is_ordered = list_tag.name == "ol"
 
-            idx_counter = 0  # teller bare punkter som faktisk får egen linje
+            # Behold original type ("A"/"a"), men lag også en normalisert kopi.
+            type_attr = list_tag.get("type") if is_ordered else None
+            type_lower = (type_attr or "").lower()
+
+            idx_counter = 0
 
             for li in list_tag.find_all("li", recursive=False):
-                own_text = _li_own_text(li)
-                nested_lists = [c for c in li.contents if getattr(c, "name", None) in ("ul", "ol")]
+                own_blocks = _li_own_blocks(li)
+                nested_lists = [
+                    c for c in li.contents
+                    if getattr(c, "name", None) in ("ul", "ol")
+                ]
 
-                # Tom wrapper-<li> med bare underliste(r): promoter underlista på samme nivå
-                if not own_text and nested_lists:
+                has_own_content = bool(own_blocks)
+
+                # Tom wrapper-li med bare underliste:
+                # behold/promoter nivået slik at strukturen ikke får kunstig ekstra innrykk.
+                if not has_own_content and nested_lists:
                     for nl in nested_lists:
-                        child_div = _render_list(nl, depth=depth + 1)
+                        child_div = _render_list(nl, depth=depth)
                         for p in child_div.find_all("p", recursive=False):
                             new_div.append(p)
                     continue
 
-                # Skriv linje for dette <li>-punktet (hvis det har tekst)
-                if own_text:
-                    indent = TOINN * max(depth, 0)
+                indent = TOINN * max(depth, 0)
 
-                    if is_ordered:
-                        idx_counter += 1
-                        if type_attr == "a":
-                            marker = f"{chr(ord('a') + idx_counter - 1)}."
-                        else:
-                            marker = f"{idx_counter}."
-                        prefix = f"{indent}{marker} "
+                if is_ordered:
+                    idx_counter += 1
+
+                    if type_lower == "a":
+                        letter = chr(ord("a") + idx_counter - 1)
+                        if type_attr == "A":
+                            letter = letter.upper()
+                        marker = f"{letter})"
                     else:
-                        prefix = f"{indent}-- "
+                        marker = f"{idx_counter}."
 
+                    first_prefix = f"{indent}{marker} "
+                else:
+                    first_prefix = f"{indent}-- "
+
+                continuation_prefix = indent
+                first_text_written = False
+
+                for kind, value in own_blocks:
                     p = soup.new_tag("p")
-                    p.string = f"{prefix}{own_text}"
-                    new_div.append(p)
 
-                # Render underlister rekursivt
-                # Underlister blir ett nivå dypere når parent-li faktisk hadde tekstlinje
-                child_depth = depth + (1 if own_text else 0)
+                    if kind == "blank":
+                        p.string = EMPTY
+                        new_div.append(p)
+                        continue
+
+                    if kind == "text":
+                        if not first_text_written:
+                            p.string = f"{first_prefix}{value}"
+                            first_text_written = True
+                        else:
+                            # Flere avsnitt inne i samme <li> skal ikke få nytt listemerke.
+                            p.string = f"{continuation_prefix}{value}"
+                        new_div.append(p)
+                        continue
+
+                    if kind in ("image", "explanation"):
+                        # Bilde/forklaring skal være ren tekst, ikke listepunkt.
+                        p.string = f"{continuation_prefix}{value}"
+                        new_div.append(p)
+                        continue
+
+                # Underlister skal ett nivå inn når parent-li hadde eget innhold.
+                child_depth = depth + (1 if has_own_content else 0)
 
                 for nl in nested_lists:
                     child_div = _render_list(nl, depth=child_depth)
@@ -560,6 +1031,103 @@ def _get_previous_paragraph(paragraph: Paragraph) -> Optional[Paragraph]:
     return None
 
 
+def _is_heading_paragraph(paragraph: Optional[Paragraph]) -> bool:
+    """Gjenkjenn overskrifter uavhengig av språk og store/små bokstaver."""
+    if paragraph is None or paragraph.style is None:
+        return False
+
+    style_name = (paragraph.style.name or "").casefold().replace(" ", "")
+    style_id = (paragraph.style.style_id or "").casefold().replace(" ", "")
+
+    return (
+        style_name.startswith("heading")
+        or style_name.startswith("overskrift")
+        or style_id.startswith("heading")
+        or style_id.startswith("overskrift")
+    )
+
+
+def _is_effectively_empty(paragraph: Paragraph) -> bool:
+    """True for tomme avsnitt, også med NBSP, zero-width-tegn eller blank_line."""
+    text = paragraph.text or ""
+    if text.strip() == EMPTY:
+        return True
+
+    text = re.sub(
+        r"[\s\u00a0\u1680\u2000-\u200d\u202f\u205f\u2060\u3000\ufeff]+",
+        "",
+        text,
+    )
+    return not text
+
+
+def _adjacent_content_paragraph(
+    document: Document,
+    paragraph_element,
+    direction: int,
+) -> Optional[Paragraph]:
+    """
+    Finn nærmeste ikke-tomme avsnitt før/etter et XML-avsnitt.
+
+    Tabeller er en reell innholdsgrense og skal ikke hoppes over. Andre tomme
+    avsnitt hoppes over, slik at også flere blanklinjer mellom to overskrifter
+    blir funnet.
+    """
+    element = (
+        paragraph_element.getprevious()
+        if direction < 0
+        else paragraph_element.getnext()
+    )
+
+    while element is not None:
+        if element.tag == qn("w:tbl"):
+            return None
+
+        if element.tag == qn("w:p"):
+            paragraph = Paragraph(element, document._body)
+            if not _is_effectively_empty(paragraph):
+                return paragraph
+
+        element = element.getprevious() if direction < 0 else element.getnext()
+
+    return None
+
+
+def _remove_blank_paragraphs_between_headings(document: Document) -> None:
+    """Fjern alle tomme avsnitt der nærmeste innhold på begge sider er overskrift."""
+    body = document._element.body
+    remove_elements = []
+
+    for element in list(body):
+        if element.tag != qn("w:p"):
+            continue
+
+        paragraph = Paragraph(element, document._body)
+        if not _is_effectively_empty(paragraph):
+            continue
+
+        previous_paragraph = _adjacent_content_paragraph(
+            document,
+            element,
+            -1,
+        )
+        next_paragraph = _adjacent_content_paragraph(
+            document,
+            element,
+            1,
+        )
+
+        if (
+            _is_heading_paragraph(previous_paragraph)
+            and _is_heading_paragraph(next_paragraph)
+        ):
+            remove_elements.append(element)
+
+    for element in remove_elements:
+        if element.getparent() is body:
+            body.remove(element)
+
+
 def _remove_paragraph(paragraph: Paragraph) -> None:
     p = paragraph._element
     p.getparent().remove(p)
@@ -592,11 +1160,16 @@ def clean_document(document: Document, args: CleanArgs) -> Document:
 
         # Tokens
         if text.strip() == EMPTY:
-            prev = _get_previous_paragraph(p)
-            if prev and prev.text.strip() == "":
-                _remove_paragraph(p)
-                continue
+            if (prev := _get_previous_paragraph(p)):
+                if (
+                    not prev.text.strip()
+                    or prev.text.startswith(NUMBER_PREFIX)
+                    or _is_heading_paragraph(prev)
+                ):
+                    _remove_paragraph(p)
+                    continue
             p.text = " "
+            text = p.text
 
         if TOINN in text:
             p.text = text.replace(TOINN, "  ")
@@ -614,20 +1187,455 @@ def clean_document(document: Document, args: CleanArgs) -> Document:
                 continue
 
         # Blank linje før overskrifter (hvis ikke blank/side nr. fra før)
-        if p.style and "Heading" in p.style.name:
+        if _is_heading_paragraph(p):
             prev = _get_previous_paragraph(p)
-            if prev and not (prev.text.strip() == "" or prev.text.strip().startswith(NUMBER_PREFIX)):
+            if prev and not (
+                not prev.text.strip()
+                or prev.text.strip().startswith(NUMBER_PREFIX)
+                or _is_heading_paragraph(prev)
+            ):
                 _insert_paragraph_after(prev, "")
 
-        # Sett font for alle runs
-        for run in p.runs:
-            f = run.font
-            f.name = font_name
-            f.size = Pt(font_size)
-            # Øst-Asia fallback (Word)
-            if run._element.rPr is not None:
-                run._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
+    for i, p in enumerate(list(document.paragraphs)):
+        if not p.text.strip() and (prev := _get_previous_paragraph(p)) and prev.text.startswith(NUMBER_PREFIX):
+            _remove_paragraph(p)
 
+    # Pandoc eller tidligere konverteringsledd kan allerede ha laget én eller
+    # flere tomme w:p mellom overskriftene. Fjern dem uavhengig av opphav.
+    _remove_blank_paragraphs_between_headings(document)
+
+    # Global regel: første innholdsavsnitt etter en tom linje skal starte
+    # helt fra margen, uavhengig av hvilken stil Pandoc har gitt avsnittet.
+    _set_content_after_blank_lines_from_margin(document)
+
+    # TOC-hierarkiet skal overstyre den generelle "etter blanklinje fra marg"-
+    # regelen: nivå 1 fra marg, deretter ett rekursivt innrykk per nivå.
+    _format_toc_indentation(document)
+
+    return document
+
+
+
+
+def _format_toc_indentation(document: Document) -> None:
+    """
+    Bruk XHTML-hierarkiet til å formatere innholdsfortegnelsen rekursivt.
+
+      nivå 1: 0 pt fra marg
+      nivå 2: 18 pt
+      nivå 3: 36 pt
+      nivå 4: 54 pt
+      ...
+
+    Markøren fjernes direkte fra Word-XML-en slik at eventuelle hyperlinks og
+    annen inline-formatering i TOC-linjen bevares.
+    """
+    marker_re = re.compile(
+        rf"^{re.escape(TOC_LEVEL_PREFIX)}(\d+)::"
+    )
+
+    for paragraph in document.paragraphs:
+        full_text = paragraph.text or ""
+        match = marker_re.match(full_text)
+        if not match:
+            continue
+
+        level = max(1, int(match.group(1)))
+        marker = match.group(0)
+
+        # Fjern markøren uten å erstatte hele paragraph.text; det ville kunne
+        # ødelegge hyperlinks og run-formattering.
+        remaining = marker
+        for text_node in paragraph._p.iter(qn("w:t")):
+            if not remaining:
+                break
+            node_text = text_node.text or ""
+            if not node_text:
+                continue
+
+            if remaining.startswith(node_text):
+                remaining = remaining[len(node_text):]
+                text_node.text = ""
+            elif node_text.startswith(remaining):
+                text_node.text = node_text[len(remaining):]
+                remaining = ""
+            else:
+                # Normaltilfellet: hele markøren ligger i første w:t.
+                if marker in node_text:
+                    text_node.text = node_text.replace(marker, "", 1)
+                    remaining = ""
+                break
+
+        indent_pt = (level - 1) * TOC_INDENT_STEP_PT
+        paragraph.paragraph_format.left_indent = Pt(indent_pt)
+        paragraph.paragraph_format.first_line_indent = Pt(0)
+        paragraph.paragraph_format.right_indent = Pt(0)
+
+
+def _set_content_after_blank_lines_from_margin(document: Document) -> None:
+    """
+    Sett første innholdsavsnitt etter en reell tom linje helt fra margen.
+
+    Dette gjøres i DOCX-leddet, etter at blank_line-tokenene er normalisert,
+    fordi regelen gjelder den visuelle avsnittsstrukturen i sluttresultatet
+    uavhengig av hvordan XHTML-kilden var merket opp.
+
+    Bare det første ikke-tomme avsnittet etter den tomme linjen berøres.
+    Flere tomme linjer på rad behandles som én avstand.
+    """
+    previous_was_blank = False
+
+    for paragraph in document.paragraphs:
+        if _is_effectively_empty(paragraph):
+            previous_was_blank = True
+            continue
+
+        if previous_was_blank:
+            _set_paragraph_from_margin(
+                paragraph,
+                document,
+                use_normal_no_indent=False,
+            )
+
+        previous_was_blank = False
+
+def _set_paragraph_from_margin(
+    paragraph: Paragraph,
+    document: Document,
+    *,
+    use_normal_no_indent: bool = False,
+) -> None:
+    """Fjern avsnittsinnrykk, og bruk eventuelt NormalNoIndent-stilen."""
+    if use_normal_no_indent:
+        try:
+            paragraph.style = document.styles["NormalNoIndent"]
+        except KeyError:
+            # Direkte formatering nedenfor gir riktig marg også med en eldre mal.
+            pass
+
+    paragraph.paragraph_format.left_indent = Pt(0)
+    paragraph.paragraph_format.right_indent = Pt(0)
+    paragraph.paragraph_format.first_line_indent = Pt(0)
+
+
+def _iter_table_paragraphs(table):
+    """Yield alle avsnitt i en tabell, også i nestede tabeller."""
+    seen_cells = set()
+    for row in table.rows:
+        for cell in row.cells:
+            cell_element = cell._tc
+            if cell_element in seen_cells:
+                continue
+            seen_cells.add(cell_element)
+
+            yield from cell.paragraphs
+            for nested_table in cell.tables:
+                yield from _iter_table_paragraphs(nested_table)
+
+
+def _set_tables_from_margin(document: Document) -> None:
+    """Plasser tabeller ved margen og bruk NormalNoIndent i tabellceller."""
+    for table in document.tables:
+        tbl_pr = table._tbl.tblPr
+        tbl_ind = tbl_pr.find(qn("w:tblInd"))
+        if tbl_ind is None:
+            tbl_ind = OxmlElement("w:tblInd")
+            tbl_pr.append(tbl_ind)
+        tbl_ind.set(qn("w:w"), "0")
+        tbl_ind.set(qn("w:type"), "dxa")
+
+        for paragraph in _iter_table_paragraphs(table):
+            _set_paragraph_from_margin(
+                paragraph,
+                document,
+                use_normal_no_indent=True,
+            )
+
+
+def _numbering_level(document: Document, num_id: str, level: str):
+    """Finn w:lvl som et konkret numId/ilvl peker på."""
+    try:
+        numbering = document.part.numbering_part.element
+    except (AttributeError, KeyError):
+        return None
+
+    abstract_id = None
+    for num in numbering.findall(qn("w:num")):
+        if num.get(qn("w:numId")) != num_id:
+            continue
+        abstract_ref = num.find(qn("w:abstractNumId"))
+        if abstract_ref is not None:
+            abstract_id = abstract_ref.get(qn("w:val"))
+        break
+
+    if abstract_id is None:
+        return None
+
+    for abstract_num in numbering.findall(qn("w:abstractNum")):
+        if abstract_num.get(qn("w:abstractNumId")) != abstract_id:
+            continue
+        for lvl in abstract_num.findall(qn("w:lvl")):
+            if lvl.get(qn("w:ilvl")) == level:
+                return lvl
+    return None
+
+
+def _set_level_zero_lists_from_margin(document: Document) -> None:
+    """
+    Flytt markøren for nivå-0-lister til venstremargen.
+
+    Pandoc legger vanligvis inn left=720/hanging=480 i numbering.xml. Direkte
+    w:ind på avsnittet har høyere prioritet. Ved å sette left lik hanging blir
+    markørposisjonen left-hanging = 0, mens brutte linjer fortsatt flukter med
+    den første tekstlinjen. Nivå 1 og dypere beholdes uendret.
+    """
+    paragraphs = list(document.paragraphs)
+    for table in document.tables:
+        paragraphs.extend(_iter_table_paragraphs(table))
+
+    for paragraph in paragraphs:
+        p_pr = paragraph._p.pPr
+        if p_pr is None:
+            continue
+        num_pr = p_pr.find(qn("w:numPr"))
+        if num_pr is None:
+            continue
+
+        ilvl = num_pr.find(qn("w:ilvl"))
+        num_id_element = num_pr.find(qn("w:numId"))
+        level = ilvl.get(qn("w:val")) if ilvl is not None else "0"
+        if level != "0" or num_id_element is None:
+            continue
+
+        num_id = num_id_element.get(qn("w:val"))
+        lvl = _numbering_level(document, num_id, level)
+
+        hanging = 360
+        if lvl is not None:
+            lvl_p_pr = lvl.find(qn("w:pPr"))
+            lvl_ind = lvl_p_pr.find(qn("w:ind")) if lvl_p_pr is not None else None
+            if lvl_ind is not None:
+                try:
+                    hanging = max(1, int(lvl_ind.get(qn("w:hanging"), hanging)))
+                except (TypeError, ValueError):
+                    hanging = 360
+
+        ind = p_pr.find(qn("w:ind"))
+        if ind is None:
+            ind = OxmlElement("w:ind")
+            p_pr.append(ind)
+        ind.set(qn("w:left"), str(hanging))
+        ind.set(qn("w:hanging"), str(hanging))
+        ind.attrib.pop(qn("w:firstLine"), None)
+
+        tabs = p_pr.find(qn("w:tabs"))
+        if tabs is None:
+            tabs = OxmlElement("w:tabs")
+            p_pr.append(tabs)
+        num_tab = None
+        for tab in tabs.findall(qn("w:tab")):
+            if tab.get(qn("w:val")) == "num":
+                num_tab = tab
+                break
+        if num_tab is None:
+            num_tab = OxmlElement("w:tab")
+            tabs.append(num_tab)
+        num_tab.set(qn("w:val"), "num")
+        num_tab.set(qn("w:pos"), str(hanging))
+
+
+def _set_marked_blocks_from_margin(document: Document) -> None:
+    """Normaliser ramme-, bilde- og ordlistebolker med omsluttende blanklinjer."""
+    paragraphs = list(document.paragraphs)
+    normalized = [" ".join((p.text or "").split()).casefold() for p in paragraphs]
+
+    def is_blank(index: int) -> bool:
+        return not normalized[index]
+
+    def is_opening(text: str) -> bool:
+        return text.startswith((
+            "ramme:",
+            "bilde:",
+            "ramme/bilde:",
+            "ordliste:",
+            "ordforklaringer:",
+            "gloser:",
+            "[ramme start",
+            "[bilde start",
+        ))
+
+    def is_closing(text: str) -> bool:
+        return text.startswith((
+            "[ramme slutt]",
+            "[bilde slutt]",
+            "ramme slutt",
+            "bilde slutt",
+            "ordliste slutt",
+            "ordforklaringer slutt",
+            "gloser slutt",
+        ))
+
+    i = 0
+    while i < len(paragraphs):
+        if not is_opening(normalized[i]):
+            i += 1
+            continue
+
+        glossary_block = normalized[i].startswith((
+            "ordliste:",
+            "ordforklaringer:",
+            "gloser:",
+        ))
+        start = i - 1 if i > 0 and is_blank(i - 1) else i
+        end = i
+
+        # Rammer avsluttes normalt med [Ramme slutt]. For en enkeltstående
+        # Bilde:-bolk uten sluttmarkør brukes neste tomme avsnitt som grense.
+        closing_index = None
+        next_blank = None
+        for j in range(i + 1, len(paragraphs)):
+            if is_closing(normalized[j]):
+                closing_index = j
+                break
+            if next_blank is None and is_blank(j):
+                next_blank = j
+            if j > i + 1 and is_opening(normalized[j]):
+                break
+
+        if closing_index is not None:
+            end = closing_index
+            if end + 1 < len(paragraphs) and is_blank(end + 1):
+                end += 1
+        elif next_blank is not None:
+            end = next_blank
+
+        for index in range(start, end + 1):
+            marker_or_blank = (
+                is_blank(index)
+                or is_opening(normalized[index])
+                or is_closing(normalized[index])
+            )
+            _set_paragraph_from_margin(
+                paragraphs[index],
+                document,
+                use_normal_no_indent=(glossary_block or marker_or_blank),
+            )
+
+        i = end + 1
+
+
+def _set_senior_image_layout(document: Document, grade: int) -> None:
+    """Image text: margin for labels/lists; TOINN for continuation prose.
+
+    A single caption is flush; when both explanation and caption are present,
+    caption starts two spaces in. Lists retain their existing list layout.
+    """
+    if grade < 8:
+        return
+
+    paragraphs = list(document.paragraphs)
+    for i, paragraph in enumerate(paragraphs):
+        text = (paragraph.text or '').strip()
+        if not text.casefold().startswith('bilde:'):
+            continue
+        _set_paragraph_from_margin(paragraph, document, use_normal_no_indent=True)
+        j = i + 1
+        while j < len(paragraphs) and paragraphs[j].text.strip():
+            p = paragraphs[j]
+            t = p.text.strip()
+            low = t.casefold()
+            if low.startswith('forklaring:') or low.startswith('beskrivelse:'):
+                _set_paragraph_from_margin(p, document, use_normal_no_indent=True)
+            elif low.startswith('bildetekst:'):
+                _set_paragraph_from_margin(p, document, use_normal_no_indent=True)
+                has_explanation = any(paragraphs[k].text.strip().casefold().startswith(('forklaring:', 'beskrivelse:')) for k in range(i+1,j))
+                if has_explanation and not p.text.startswith('  '):
+                    p.text = '  ' + p.text.lstrip()
+                elif not has_explanation:
+                    p.text = p.text.lstrip()
+            elif p.text.startswith('  '):
+                _set_paragraph_from_margin(p, document, use_normal_no_indent=True)
+            j += 1
+
+
+def _set_glossary_entries_layout(document: Document, grade: int) -> None:
+    """
+    Fjern det interne oppslagsprefikset og formater ordforklaringene.
+
+    Trinn 1–5:  fra marg uten innrykk.
+    Fra trinn 6: fra marg med 360 twips hengende innrykk og uten listetegn.
+    """
+    paragraphs = list(document.paragraphs)
+    for table in document.tables:
+        paragraphs.extend(_iter_table_paragraphs(table))
+
+    for paragraph in paragraphs:
+        if GLOSSARY_ENTRY_PREFIX not in (paragraph.text or ""):
+            continue
+
+        # Oppslagslinjene er ren tekst etter dl-konverteringen. Å sette text på
+        # nytt fjerner prefikset sikkert også dersom Pandoc har delt det i runs.
+        paragraph.text = paragraph.text.replace(GLOSSARY_ENTRY_PREFIX, "", 1)
+        _set_paragraph_from_margin(
+            paragraph,
+            document,
+            use_normal_no_indent=True,
+        )
+
+        if grade >= 6:
+            paragraph.paragraph_format.left_indent = Pt(
+                GLOSSARY_HANGING_INDENT_PT
+            )
+            paragraph.paragraph_format.first_line_indent = Pt(
+                -GLOSSARY_HANGING_INDENT_PT
+            )
+
+
+def _set_page_and_exercise_numbers_from_margin(document: Document) -> None:
+    """Plasser sidetall (--- N) og oppgavenummer (>>> N.) helt fra margen."""
+    patterns = (
+        re.compile(r'^\s*---\s+\S+'),
+        re.compile(r'^\s*>>>\s+\d+(?:[.,]\d+)*\.'),
+    )
+
+    paragraphs = list(document.paragraphs)
+    for table in document.tables:
+        paragraphs.extend(_iter_table_paragraphs(table))
+
+    for paragraph in paragraphs:
+        text = paragraph.text or ''
+        if any(pattern.match(text) for pattern in patterns):
+            _set_paragraph_from_margin(
+                paragraph,
+                document,
+                use_normal_no_indent=True,
+            )
+            # Dersom Pandoc har arvet nummerering fra en liste, fjern den.
+            p_pr = paragraph._p.pPr
+            if p_pr is not None:
+                num_pr = p_pr.find(qn('w:numPr'))
+                if num_pr is not None:
+                    p_pr.remove(num_pr)
+
+
+def normalize_margin_layout(
+    document: Document,
+    logger: logging.Logger,
+    grade: Optional[int] = None,
+) -> Document:
+    """Samlet etterbehandling for tabeller, nivå-0-lister og markerte bolker."""
+    effective_grade = grade if grade is not None else DEFAULT_GRADE
+    logger.info(
+        "Normaliserer tabeller, nivå-0-lister og ramme-/bilde-/ordforklaringsbolker fra marg"
+    )
+    _set_tables_from_margin(document)
+    _set_marked_blocks_from_margin(document)
+    _set_senior_image_layout(document, effective_grade)
+    _set_glossary_entries_layout(document, effective_grade)
+    # Kjøres etter generell listejustering slik at disse spesiallinjene alltid
+    # ender helt fra margen og uten arvet Word-nummerering.
+    _set_level_zero_lists_from_margin(document)
+    _set_page_and_exercise_numbers_from_margin(document)
     return document
 
 
@@ -723,6 +1731,7 @@ def xhtml_to_docx(
         # clean
         doc = Document(str(out_docx))
         doc = clean_document(doc, clean_args, args.logger)
+        doc = normalize_margin_layout(doc, args.logger, grade=grade)
 
         # output as bytes
         final_docx = tmp / Path(output_filename).name
@@ -814,6 +1823,7 @@ def convert(args):
         try:
             doc = Document(str(out_docx_tmp))
             doc = clean_document(doc, args)
+            doc = normalize_margin_layout(doc, args.logger, grade=args.grade)
         except Exception as e:
             args.logger.error("DOCX-etterbehandling feilet: %s", e)
             return 1
