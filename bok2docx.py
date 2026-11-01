@@ -1780,6 +1780,7 @@ def xhtml_to_docx(
         doc = remove_duplicate_opening_title(doc)
         doc = normalize_margin_layout(doc, args.logger, grade=grade)
         doc = format_about_book_from_margin(doc)
+        doc = remove_word_bookmarks(doc, logger)
 
         # output as bytes
         final_docx = tmp / Path(output_filename).name
@@ -1874,6 +1875,7 @@ def convert(args):
             doc = remove_duplicate_opening_title(doc)
             doc = normalize_margin_layout(doc, args.logger, grade=args.grade)
             doc = format_about_book_from_margin(doc)
+            doc = remove_word_bookmarks(doc, args.logger)
         except Exception as e:
             args.logger.error("DOCX-etterbehandling feilet: %s", e)
             return 1
@@ -1926,6 +1928,50 @@ def convert(args):
 
     args.logger.error("Ukjent kommando.")
     return 2
+
+def remove_word_bookmarks(doc: Document, log: Optional[logging.Logger] = None) -> Document:
+    """Fjern Word-bokmerker og interne lenker uten å miste synlig tekst.
+
+    Eksterne lenker beholdes. Interne lenker (inkludert klikkbar
+    innholdsfortegnelse) blir vanlig tekst, slik at de ikke peker til
+    bokmerker som ikke lenger finnes.
+    """
+    from docx.oxml.ns import qn
+
+    removed_bookmarks = 0
+    removed_links = 0
+    # Dokumentdel, topp-/bunntekster og eventuelle andre Word-deler.
+    for part in doc.part.package.parts:
+        if not str(part.partname).startswith('/word/'):
+            continue
+        root = getattr(part, '_element', None)
+        if root is None:
+            continue
+        for el in list(root.iter()):
+            if el.tag in (qn('w:bookmarkStart'), qn('w:bookmarkEnd')):
+                parent = el.getparent()
+                if parent is not None:
+                    parent.remove(el)
+                    removed_bookmarks += 1
+        for el in list(root.iter(qn('w:hyperlink'))):
+            # Kun interne lenker. Eksterne lenker har r:id og beholdes.
+            if el.get(qn('w:anchor')) is None:
+                continue
+            parent = el.getparent()
+            if parent is None:
+                continue
+            pos = parent.index(el)
+            for child in list(el):
+                el.remove(child)
+                parent.insert(pos, child)
+                pos += 1
+            parent.remove(el)
+            removed_links += 1
+    if log:
+        log.info('Fjernet %d bokmerkeelementer og %d interne lenker',
+                 removed_bookmarks, removed_links)
+    return doc
+
 
 # ==============================================================================
 # 5) CLI
